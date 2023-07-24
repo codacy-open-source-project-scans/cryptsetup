@@ -883,7 +883,7 @@ static int action_status(void)
 	struct crypt_device *cd = NULL;
 	char *backing_file;
 	const char *device;
-	int path = 0, r = 0;
+	int path = 0, r = 0, hw_enc;
 
 	/* perhaps a path, not a dm device name */
 	if (strchr(action_argv[0], '/'))
@@ -932,9 +932,27 @@ static int action_status(void)
 		if (r < 0 && r != -ENOTSUP)
 			goto out;
 
-		log_std("  cipher:  %s-%s\n", crypt_get_cipher(cd), crypt_get_cipher_mode(cd));
-		log_std("  keysize: %d bits\n", crypt_get_volume_key_size(cd) * 8);
-		log_std("  key location: %s\n", (cad.flags & CRYPT_ACTIVATE_KEYRING_KEY) ? "keyring" : "dm-crypt");
+		hw_enc = crypt_get_hw_encryption_type(cd);
+		if (hw_enc < 0) {
+			r = hw_enc;
+			goto out;
+		}
+
+		if (hw_enc == CRYPT_SW_ONLY) {
+			log_std("  cipher:  %s-%s\n", crypt_get_cipher(cd), crypt_get_cipher_mode(cd));
+			log_std("  keysize: %d bits\n", crypt_get_volume_key_size(cd) * 8);
+			log_std("  key location: %s\n", (cad.flags & CRYPT_ACTIVATE_KEYRING_KEY) ? "keyring" : "dm-crypt");
+		} else if (hw_enc == CRYPT_OPAL_HW_ONLY) {
+			log_std("  encryption: HW OPAL only\n");
+			log_std("  OPAL keysize: %d bits\n", crypt_get_hw_encryption_key_size(cd) * 8);
+		} else if (hw_enc == CRYPT_SW_AND_OPAL_HW) {
+			log_std("  encryption: dm-crypt over HW OPAL\n");
+			log_std("  OPAL keysize: %d bits\n", crypt_get_hw_encryption_key_size(cd) * 8);
+			log_std("  cipher:  %s-%s\n", crypt_get_cipher(cd), crypt_get_cipher_mode(cd));
+			log_std("  keysize: %d bits\n", (crypt_get_volume_key_size(cd) - crypt_get_hw_encryption_key_size(cd)) * 8);
+			log_std("  key location: %s\n", (cad.flags & CRYPT_ACTIVATE_KEYRING_KEY) ? "keyring" : "dm-crypt");
+		}
+
 		if (ip.integrity)
 			log_std("  integrity: %s\n", ip.integrity);
 		if (ip.integrity_key_size)
@@ -1374,6 +1392,9 @@ int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_password
 		.label = ARG_STR(OPT_LABEL_ID),
 		.subsystem = ARG_STR(OPT_SUBSYSTEM_ID)
 	};
+	struct crypt_params_hw_opal opal_params = {
+		.user_key_size = DEFAULT_LUKS1_KEYBITS / 8
+	};
 	void *params;
 
 	type = luksType(device_type);
@@ -1487,6 +1508,11 @@ int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_password
 
 	keysize = get_adjusted_key_size(cipher_mode, DEFAULT_LUKS1_KEYBITS, integrity_keysize);
 
+	if (ARG_SET(OPT_HW_OPAL_ONLY_ID))
+		keysize = opal_params.user_key_size;
+	else if (ARG_SET(OPT_HW_OPAL_ID))
+		keysize += opal_params.user_key_size;
+
 	if (ARG_SET(OPT_USE_RANDOM_ID))
 		crypt_set_rng_type(cd, CRYPT_RNG_RANDOM);
 	else if (ARG_SET(OPT_USE_URANDOM_ID))
@@ -1497,6 +1523,19 @@ int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_password
 			  ARG_UINT32(OPT_TIMEOUT_ID), verify_passphrase(1), !ARG_SET(OPT_FORCE_PASSWORD_ID), cd);
 	if (r < 0)
 		goto out;
+
+	if (ARG_SET(OPT_HW_OPAL_ID) || ARG_SET(OPT_HW_OPAL_ONLY_ID)) {
+		r = tools_get_key("Enter OPAL Admin password: ", CONST_CAST(char **)&opal_params.admin_key, &opal_params.admin_key_size,
+				  0, 0, NULL,
+				  ARG_UINT32(OPT_TIMEOUT_ID), verify_passphrase(1), !ARG_SET(OPT_FORCE_PASSWORD_ID), cd);
+		if (r < 0)
+			goto out;
+		if (opal_params.admin_key_size == 0) {
+			log_err(_("OPAL Admin password cannot be empty."));
+			r = -EPERM;
+			goto out;
+		}
+	}
 
 	if (ARG_SET(OPT_VOLUME_KEY_FILE_ID)) {
 		r = tools_read_vk(ARG_STR(OPT_VOLUME_KEY_FILE_ID), &key, keysize);
@@ -1517,7 +1556,13 @@ int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_password
 	if (ARG_SET(OPT_INTEGRITY_LEGACY_PADDING_ID))
 		crypt_set_compatibility(cd, CRYPT_COMPAT_LEGACY_INTEGRITY_PADDING);
 
-	r = crypt_format(cd, type, cipher, cipher_mode,
+	if (ARG_SET(OPT_HW_OPAL_ID) || ARG_SET(OPT_HW_OPAL_ONLY_ID))
+		r = crypt_format_luks2_opal(cd,
+			 ARG_SET(OPT_HW_OPAL_ONLY_ID) ? NULL : cipher,
+			 ARG_SET(OPT_HW_OPAL_ONLY_ID) ? NULL : cipher_mode,
+			 ARG_STR(OPT_UUID_ID), key, keysize, params, &opal_params);
+	else
+		r = crypt_format(cd, type, cipher, cipher_mode,
 			 ARG_STR(OPT_UUID_ID), key, keysize, params);
 	check_signal(&r);
 	if (r < 0)
@@ -1550,6 +1595,7 @@ out:
 	}
 
 	crypt_safe_free(key);
+	crypt_safe_free(CONST_CAST(void *)opal_params.admin_key);
 
 	return r;
 }
@@ -2644,15 +2690,46 @@ out:
 	return r;
 }
 
+static int opal_erase(struct crypt_device *cd, bool factory_reset) {
+	char *password = NULL;
+	size_t password_size = 0;
+	int r;
+
+	r = tools_get_key(factory_reset ? _("Enter OPAL PSID: ") : _("Enter OPAL Admin password: "),
+				&password, &password_size,
+				0, 0, NULL,
+				ARG_UINT32(OPT_TIMEOUT_ID), verify_passphrase(1), !ARG_SET(OPT_FORCE_PASSWORD_ID), cd);
+	if (r < 0)
+		return r;
+
+	if (factory_reset && !ARG_SET(OPT_BATCH_MODE_ID) &&
+		!yesDialog(_("WARNING: WHOLE disk will be factory reset and all data will be lost! Continue?"),
+			_("Operation aborted.\n"))) {
+		return -EPERM;
+	}
+
+	return crypt_wipe_hw_opal(cd,
+			factory_reset ? CRYPT_NO_SEGMENT : CRYPT_LUKS2_SEGMENT,
+			password,
+			password_size,
+			0);
+}
+
 static int action_luksErase(void)
 {
 	struct crypt_device *cd = NULL;
 	crypt_keyslot_info ki;
 	char *msg = NULL;
-	int i, max, r;
+	int i, max, r, hw_enc;
 
 	if ((r = crypt_init(&cd, uuid_or_device_header(NULL))))
 		goto out;
+
+	/* Allow factory reset even if there's no LUKS header, as long as OPAL is enabled on the device */
+	if (ARG_SET(OPT_HW_OPAL_FACTORY_RESET_ID)) {
+		r = opal_erase(cd, true);
+		goto out;
+	}
 
 	if ((r = crypt_load(cd, luksType(device_type), NULL))) {
 		log_err(_("Device %s is not a valid LUKS device."),
@@ -2660,7 +2737,15 @@ static int action_luksErase(void)
 		goto out;
 	}
 
-	if(asprintf(&msg, _("This operation will erase all keyslots on device %s.\n"
+	hw_enc = crypt_get_hw_encryption_type(cd);
+	if (hw_enc < 0)
+		goto out;
+	if (hw_enc == CRYPT_OPAL_HW_ONLY || hw_enc == CRYPT_SW_AND_OPAL_HW) {
+		r = opal_erase(cd, false);
+		goto out;
+	}
+
+	if (asprintf(&msg, _("This operation will erase all keyslots on device %s.\n"
 			    "Device will become unusable after this operation."),
 			    uuid_or_device_header(NULL)) == -1) {
 		r = -ENOMEM;
@@ -3511,7 +3596,10 @@ int main(int argc, const char **argv)
 		aname = CLOSE_ACTION;
 	} else if (!strcmp(aname, "luksErase")) {
 		aname = ERASE_ACTION;
-		device_type = "luks";
+		if (ARG_SET(OPT_TYPE_ID))
+			device_type = ARG_STR(OPT_TYPE_ID);
+		else
+			device_type = "luks";
 	} else if (!strcmp(aname, "luksConfig")) {
 		aname = CONFIG_ACTION;
 		device_type = "luks2";

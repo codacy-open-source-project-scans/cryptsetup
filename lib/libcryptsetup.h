@@ -451,6 +451,34 @@ const char *crypt_get_type(struct crypt_device *cd);
 const char *crypt_get_default_type(void);
 
 /**
+ * @defgroup crypt-hw-encryption-types HW encryption type
+ * @addtogroup crypt-hw-encryption-types
+ * @{
+ */
+/** SW encryption, no OPAL encryption in place (default) */
+#define CRYPT_SW_ONLY        INT16_C(0)
+/** OPAL HW encryption only (no SW encryption!) */
+#define CRYPT_OPAL_HW_ONLY   INT16_C(1)
+/** SW encryption stacked over OPAL HW encryption  */
+#define CRYPT_SW_AND_OPAL_HW INT16_C(2)
+/** @} */
+
+/**
+ * Get HW encryption type
+ *
+ * @return HW encryption type (see @link crypt-hw-encryption-types @endlink)
+ *         or negative errno otherwise.
+ */
+int crypt_get_hw_encryption_type(struct crypt_device *cd);
+
+/**
+ * Get HW encryption (like OPAL) key size (in bytes)
+ *
+ * @return key size or 0 if no HW encryption is used.
+ */
+int crypt_get_hw_encryption_key_size(struct crypt_device *cd);
+
+/**
  *
  * Structure used as parameter for PLAIN device type.
  *
@@ -609,6 +637,18 @@ struct crypt_params_luks2 {
 	const char *label;       /**< header label or @e NULL*/
 	const char *subsystem;   /**< header subsystem label or @e NULL*/
 };
+
+/**
+ * Structure used as parameter for OPAL (HW encrypted) device type.
+ *
+ * @see crypt_format_luks2_opal
+ *
+ */
+struct crypt_params_hw_opal {
+	const char *admin_key;   /**< admin key */
+	size_t admin_key_size;   /**< admin key size in bytes */
+	size_t user_key_size;    /**< user authority key size part in bytes */
+};
 /** @} */
 
 /**
@@ -647,6 +687,34 @@ int crypt_format(struct crypt_device *cd,
 	const char *volume_key,
 	size_t volume_key_size,
 	void *params);
+
+/**
+ * Create (format) new LUKS2 crypt device over HW OPAL device but do not activate it.
+ *
+ * @pre @e cd contains initialized and not formatted device context (device type must @b not be set)
+ *
+ * @param cd crypt device handle
+ * @param cipher for SW encryption (e.g. "aes") or NULL for HW encryption only
+ * @param cipher_mode including IV specification (e.g. "xts-plain") or NULL for HW encryption only
+ * @param uuid requested UUID or @e NULL if it should be generated
+ * @param volume_key pre-generated volume key or @e NULL if it should be generated (only for LUKS2 SW encryption)
+ * @param volume_key_size size of volume key in bytes (only for SW encryption).
+ * @param params LUKS2 crypt type specific parameters (see @link crypt-type @endlink)
+ * @param opal_params OPAL specific parameters
+ *
+ * @returns @e 0 on success or negative errno value otherwise.
+ *
+ * @note Note that crypt_format_luks2_opal does not create LUKS keyslot.
+ *       To create keyslot call any crypt_keyslot_add_* function.
+ */
+int crypt_format_luks2_opal(struct crypt_device *cd,
+	const char *cipher,
+	const char *cipher_mode,
+	const char *uuid,
+	const char *volume_keys,
+	size_t volume_keys_size,
+	struct crypt_params_luks2 *params,
+	struct crypt_params_hw_opal *opal_params);
 
 /**
  * Set format compatibility flags.
@@ -2263,6 +2331,35 @@ int crypt_wipe(struct crypt_device *cd,
 /** Use direct-io */
 #define CRYPT_WIPE_NO_DIRECT_IO (UINT32_C(1) << 0)
 /** @} */
+
+enum {
+	CRYPT_LUKS2_SEGMENT = -2,
+	CRYPT_NO_SEGMENT = -1,
+};
+
+/**
+ * Safe erase of a partition or an entire OPAL device. WARNING: ALL DATA ON
+ * PARTITION/DISK WILL BE LOST. If the CRYPT_NO_SEGMENT is passed as the segment
+ * parameter, the entire device will be wiped, not just what is included in the
+ * LUKS2 device/partition.
+ *
+ * @param cd crypt device handle
+ * @param segment the segment number to wipe (0..8), or CRYPT_LUKS2_SEGMENT
+ *        to wipe the segment configured in the LUKS2 header, or CRYPT_NO_SEGMENT
+ *        to wipe the entire device via a factory reset.
+ * @param password admin password/PSID (for factory reset) to wipe the
+ *        partition/device
+ * @param password_size length of password/PSID
+ * @param flags (currently unused)
+ *
+ * @return @e 0 on success or negative errno value otherwise.
+ */
+int crypt_wipe_hw_opal(struct crypt_device *cd,
+	int segment, /* 0..8, CRYPT_LUKS2_SEGMENT -2, CRYPT_NO_SEGMENT -1 */
+	const char *password, /* Admin1 PIN or PSID */
+	size_t password_size,
+	uint32_t flags /* currently unused */
+);
 
 /**
  * @defgroup crypt-tokens LUKS2 token wrapper access
