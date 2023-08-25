@@ -1009,6 +1009,23 @@ int crypt_resume_by_token_pin(struct crypt_device *cd,
 	const char *pin,
 	size_t pin_size,
 	void *usrptr);
+
+/**
+ * Resume crypt device using keyslot context.
+ *
+ * @param cd crypt device handle
+ * @param name name of device to resume
+ * @param keyslot requested keyslot to check or @e CRYPT_ANY_SLOT, keyslot is
+ *        ignored for unlock methods not based on passphrase
+ * @param kc keyslot context providing volume key or passphrase.
+ *
+ * @return unlocked key slot number for passphrase-based unlock, zero for other
+ *         unlock methods (e.g. volume key context) or negative errno on error.
+ */
+int crypt_resume_by_keyslot_context(struct crypt_device *cd,
+			       const char *name,
+			       int keyslot,
+			       struct crypt_keyslot_context *kc);
 /** @} */
 
 /**
@@ -1263,6 +1280,59 @@ int crypt_keyslot_context_init_by_volume_key(struct crypt_device *cd,
 	struct crypt_keyslot_context **kc);
 
 /**
+ * Initialize keyslot context via signed key.
+ *
+ * @param cd crypt device handle initialized to device context
+ *
+ * @param volume_key provided volume key
+ * @param volume_key_size size of volume_key
+ * @param signature buffer with signature for the key
+ * @param signature_size bsize of signature buffer
+ * @param kc returns crypt keyslot context handle type CRYPT_KC_TYPE_SIGNED_KEY
+ *
+ * @return zero on success or negative errno otherwise.
+ *
+ * @note currently supported only with VERITY devices.
+ */
+int crypt_keyslot_context_init_by_signed_key(struct crypt_device *cd,
+	const char *volume_key,
+	size_t volume_key_size,
+	const char *signature,
+	size_t signature_size,
+	struct crypt_keyslot_context **kc);
+
+/**
+ * Initialize keyslot context via passphrase stored in a keyring.
+ *
+ * @param cd crypt device handle initialized to LUKS device context
+ *
+ * @param key_description kernel keyring key description library should look
+ *        for passphrase in
+ * @param kc returns crypt keyslot context handle type CRYPT_KC_TYPE_KEYRING
+ *
+ * @return zero on success or negative errno otherwise.
+ */
+int crypt_keyslot_context_init_by_keyring(struct crypt_device *cd,
+	const char *key_description,
+	struct crypt_keyslot_context **kc);
+
+/**
+ * Initialize keyslot context via volume key stored in a keyring.
+ *
+ * @param cd crypt device handle initialized to LUKS device context
+ *
+ * @param key_description kernel keyring key description library should look
+ *        for passphrase in. The key can be passed either as number in ASCII,
+ *        or a text representation in the form "%<key_type>:<key_name>"
+ * @param kc returns crypt keyslot context handle type CRYPT_KC_TYPE_KEYRING
+ *
+ * @return zero on success or negative errno otherwise.
+ */
+int crypt_keyslot_context_init_by_vk_in_keyring(struct crypt_device *cd,
+	const char *key_description,
+	struct crypt_keyslot_context **kc);
+
+/**
  * Get error code per keyslot context from last failed call.
  *
  * @note If @link crypt_keyslot_add_by_keyslot_context @endlink passed with
@@ -1305,6 +1375,16 @@ int crypt_keyslot_context_set_pin(struct crypt_device *cd,
 #define CRYPT_KC_TYPE_TOKEN      INT16_C(3)
 /** keyslot context initialized by volume key or unbound key (@link crypt_keyslot_context_init_by_volume_key @endlink) */
 #define CRYPT_KC_TYPE_KEY        INT16_C(4)
+/** keyslot context initialized by description of a keyring key
+ * (@link crypt_keyslot_context_init_by_keyring @endlink)
+ */
+#define CRYPT_KC_TYPE_KEYRING    INT16_C(5)
+/** keyslot context initialized by description of a keyring key containing the volume key
+ * (@link crypt_keyslot_context_init_by_vk_in_keyring @endlink)
+ */
+#define CRYPT_KC_TYPE_VK_KEYRING    INT16_C(6)
+/** keyslot context initialized by signed key (@link crypt_keyslot_context_init_by_signed_key @endlink) */
+#define CRYPT_KC_TYPE_SIGNED_KEY    INT16_C(7)
 /** @} */
 
 /**
@@ -1540,6 +1620,25 @@ int crypt_persistent_flags_get(struct crypt_device *cd,
  * @addtogroup crypt-activation
  * @{
  */
+
+/**
+ * Activate device or check using keyslot context.
+ *
+ * @param cd crypt device handle
+ * @param name name of device to create, if @e NULL only check passphrase
+ * @param keyslot requested keyslot to check or @e CRYPT_ANY_SLOT, keyslot is
+ *        ignored for unlock methods not based on passphrase
+ * @param kc keyslot context providing volume key or passphrase.
+ * @param flags activation flags
+ *
+ * @return unlocked key slot number for passphrase-based unlock, zero for other
+ *         unlock methods (e.g. volume key context) or negative errno on error.
+ */
+int crypt_activate_by_keyslot_context(struct crypt_device *cd,
+	const char *name,
+	int keyslot,
+	struct crypt_keyslot_context *kc,
+	uint32_t flags);
 
 /**
  * Activate device or check passphrase.
@@ -2972,6 +3071,36 @@ void *crypt_safe_realloc(void *data, size_t size);
  * @param size size of memory in bytes
  */
 void crypt_safe_memzero(void *data, size_t size);
+
+/**
+ * Link the volume key to the specified keyring.
+ *
+ * @param cd crypt device handle
+ * @param keyring_to_link_vk the ID of the keyring in which volume key should
+ * be linked, if @e NULL is specified, linking will be disabled (the key will
+ * be linked just to the thread keyring, which is destroyed on process exit)
+ */
+int crypt_set_keyring_to_link(struct crypt_device *cd, const char *keyring_to_link_vk);
+
+/**
+ * Set the type of volume key stored in keyring.
+ *
+ * @param cd crypt device handle
+ * @param key_type_desc the type of keyring key (e.g. "user" or "logon"), when
+ * @e NULL is specified, key type will be reset to default (logon)
+ *
+ * @return @e 0 on success or negative errno value when unknown key type was specified.
+ */
+int crypt_set_vk_keyring_type(struct crypt_device *cd, const char *key_type_desc);
+
+/**
+ * Get the type of volume key stored in keyring.
+ *
+ * @param cd crypt device handle
+ *
+ * @return string description of the keyring type (e.g. "user") or "logon" when cd is NULL
+ */
+const char *crypt_get_vk_keyring_type(struct crypt_device *cd);
 
 /** @} */
 

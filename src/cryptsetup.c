@@ -1616,6 +1616,7 @@ static int action_open_luks(void)
 	char *password = NULL;
 	size_t passwordLen;
 	struct stat st;
+	struct crypt_keyslot_context *kc = NULL;
 
 	if (ARG_SET(OPT_REFRESH_ID)) {
 		activated_name = action_argc > 1 ? action_argv[1] : action_argv[0];
@@ -1654,6 +1655,21 @@ static int action_open_luks(void)
 
 	set_activation_flags(&activate_flags);
 
+	if (ARG_SET(OPT_VOLUME_KEY_TYPE_ID)) {
+		r = crypt_set_vk_keyring_type(cd, ARG_STR(OPT_VOLUME_KEY_TYPE_ID));
+
+		if (r) {
+			log_err(_("The specified keyring key type %s is invalid."),
+				  ARG_STR(OPT_VOLUME_KEY_TYPE_ID));
+			goto out;
+		}
+	}
+
+	if (ARG_SET(OPT_LINK_VK_TO_KEYRING_ID)) {
+		if ((r = crypt_set_keyring_to_link(cd, ARG_STR(OPT_LINK_VK_TO_KEYRING_ID))))
+			return r;
+	}
+
 	if (ARG_SET(OPT_VOLUME_KEY_FILE_ID)) {
 		keysize = crypt_get_volume_key_size(cd);
 		if (!keysize && !ARG_SET(OPT_KEY_SIZE_ID)) {
@@ -1668,6 +1684,13 @@ static int action_open_luks(void)
 			goto out;
 		r = crypt_activate_by_volume_key(cd, activated_name,
 						 key, keysize, activate_flags);
+	} else if (ARG_SET(OPT_VOLUME_KEY_KEYRING_ID)) {
+		r = crypt_keyslot_context_init_by_vk_in_keyring(cd, ARG_STR(OPT_VOLUME_KEY_KEYRING_ID), &kc);
+		if (r)
+			goto out;
+		r = crypt_activate_by_keyslot_context(cd, activated_name, CRYPT_ANY_SLOT, kc, activate_flags);
+		if (r)
+			goto out;
 	} else {
 		r = crypt_activate_by_token_pin(cd, activated_name, ARG_STR(OPT_TOKEN_TYPE_ID),
 						ARG_INT32(OPT_TOKEN_ID_ID), NULL, 0, NULL, activate_flags);
@@ -1704,6 +1727,7 @@ out:
 	    (crypt_get_active_device(cd, activated_name, &cad) ||
 	     crypt_persistent_flags_set(cd, CRYPT_FLAGS_ACTIVATION, cad.flags & activate_flags)))
 		log_err(_("Device activated but cannot make flags persistent."));
+	crypt_keyslot_context_free(kc);
 
 	crypt_safe_free(key);
 	crypt_safe_free(password);
@@ -2067,6 +2091,8 @@ static int action_luksAddKey(void)
 				ARG_UINT32(OPT_KEYFILE_SIZE_ID),
 				ARG_UINT64(OPT_KEYFILE_OFFSET_ID),
 				&kc);
+	else if (ARG_SET(OPT_VOLUME_KEY_KEYRING_ID))
+		r = crypt_keyslot_context_init_by_vk_in_keyring(cd, ARG_STR(OPT_VOLUME_KEY_KEYRING_ID), &kc);
 	else if (ARG_SET(OPT_TOKEN_ID_ID) || ARG_SET(OPT_TOKEN_TYPE_ID) || ARG_SET(OPT_TOKEN_ONLY_ID)) {
 		r = crypt_keyslot_context_init_by_token(cd,
 				ARG_INT32(OPT_TOKEN_ID_ID),
@@ -2501,6 +2527,7 @@ static int action_luksResume(void)
 	int r, tries;
 	struct crypt_active_device cad;
 	const char *req_type = luksType(device_type);
+	struct crypt_keyslot_context *kc = NULL;
 
 	if (req_type && !isLUKS(req_type))
 		return -EINVAL;
@@ -2509,6 +2536,21 @@ static int action_luksResume(void)
 		return r;
 
 	r = -EINVAL;
+	if (ARG_SET(OPT_VOLUME_KEY_TYPE_ID)) {
+		r = crypt_set_vk_keyring_type(cd, ARG_STR(OPT_VOLUME_KEY_TYPE_ID));
+
+		if (r) {
+			log_err(_("The specified keyring key type %s is invalid."),
+				  ARG_STR(OPT_VOLUME_KEY_TYPE_ID));
+			goto out;
+		}
+	}
+
+	if (ARG_SET(OPT_LINK_VK_TO_KEYRING_ID)) {
+		if ((r = crypt_set_keyring_to_link(cd, ARG_STR(OPT_LINK_VK_TO_KEYRING_ID))))
+			return r;
+	}
+
 	if (!isLUKS(crypt_get_type(cd))) {
 		log_err(_("%s is not active LUKS device name or header is missing."), action_argv[0]);
 		goto out;
@@ -2543,6 +2585,14 @@ static int action_luksResume(void)
 	if (r >= 0 || quit || ARG_SET(OPT_TOKEN_ONLY_ID))
 		goto out;
 
+	if (ARG_SET(OPT_VOLUME_KEY_KEYRING_ID)) {
+		r = crypt_keyslot_context_init_by_vk_in_keyring(cd, ARG_STR(OPT_VOLUME_KEY_KEYRING_ID), &kc);
+		if (r)
+			goto out;
+		r = crypt_resume_by_keyslot_context(cd, action_argv[0], CRYPT_ANY_SLOT, kc);
+		goto out;
+	}
+
 	tries = set_tries_tty();
 	do {
 		r = tools_get_key(NULL, &password, &passwordLen,
@@ -2561,6 +2611,7 @@ static int action_luksResume(void)
 		password = NULL;
 	} while ((r == -EPERM || r == -ERANGE) && (--tries > 0));
 out:
+	crypt_keyslot_context_free(kc);
 	crypt_safe_free(password);
 	crypt_free(cd);
 	return r;
@@ -3653,6 +3704,11 @@ int main(int argc, const char **argv)
 	if (ARG_SET(OPT_PBKDF_FORCE_ITERATIONS_ID) && ARG_SET(OPT_ITER_TIME_ID))
 		usage(popt_context, EXIT_FAILURE,
 		_("PBKDF forced iterations cannot be combined with iteration time option."),
+		poptGetInvocationName(popt_context));
+
+	if (ARG_SET(OPT_DISABLE_KEYRING_ID) && ARG_SET(OPT_LINK_VK_TO_KEYRING_ID))
+		usage(popt_context, EXIT_FAILURE,
+		_("Cannot link volume key to a keyring when keyring is disabled."),
 		poptGetInvocationName(popt_context));
 
 	if (ARG_SET(OPT_DEBUG_ID) || ARG_SET(OPT_DEBUG_JSON_ID)) {

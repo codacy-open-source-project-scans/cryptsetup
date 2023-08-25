@@ -23,16 +23,23 @@
 #define _UTILS_KEYRING
 
 #include <stddef.h>
+#include <stdint.h>
 
-typedef enum { LOGON_KEY = 0, USER_KEY } key_type_t;
+typedef enum { LOGON_KEY = 0, USER_KEY, BIG_KEY, TRUSTED_KEY, ENCRYPTED_KEY, INVALID_KEY } key_type_t;
 
 const char *key_type_name(key_type_t ktype);
+key_type_t key_type_by_name(const char *name);
+int32_t keyring_by_name(const char *name);
 
 int keyring_check(void);
 
 int keyring_get_key(const char *key_desc,
 		    char **key,
 		    size_t *key_size);
+
+int keyring_read_by_id(const char *key_desc,
+		      char **passphrase,
+		      size_t *passphrase_len);
 
 int keyring_get_passphrase(const char *key_desc,
 		      char **passphrase,
@@ -51,5 +58,6 @@ int keyring_add_key_in_user_keyring(
 	size_t key_size);
 
 int keyring_revoke_and_unlink_key(key_type_t ktype, const char *key_desc);
+int keyring_link_key_to_keyring(key_type_t ktype, const char *key_desc, int keyring_to_link);
 
 #endif

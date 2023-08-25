@@ -489,6 +489,16 @@ static key_serial_t keyctl_unlink(key_serial_t key, key_serial_t keyring)
 	return syscall(__NR_keyctl, KEYCTL_UNLINK, key, keyring);
 }
 
+static long keyctl_update(key_serial_t id, const void *payload, size_t plen)
+{
+	return syscall(__NR_keyctl, KEYCTL_UPDATE, id, payload, plen);
+}
+
+static long keyctl_read(key_serial_t id, char *buffer, size_t buflen)
+{
+	return syscall(__NR_keyctl, KEYCTL_READ, id, buffer, buflen);
+}
+
 static key_serial_t request_key(const char *type,
 	const char *description,
 	const char *callout_info,
@@ -497,14 +507,20 @@ static key_serial_t request_key(const char *type,
 	return syscall(__NR_request_key, type, description, callout_info, keyring);
 }
 
-static key_serial_t _kernel_key_by_segment(struct crypt_device *_cd, int segment)
+static key_serial_t _kernel_key_by_segment_and_type(struct crypt_device *_cd, int segment,
+						    const char* type)
 {
 	char key_description[1024];
 
 	if (snprintf(key_description, sizeof(key_description), "cryptsetup:%s-d%u", crypt_get_uuid(_cd), segment) < 1)
 		return -1;
 
-	return request_key("logon", key_description, NULL, 0);
+	return request_key(type, key_description, NULL, 0);
+}
+
+static key_serial_t _kernel_key_by_segment(struct crypt_device *_cd, int segment)
+{
+	return _kernel_key_by_segment_and_type(cd, segment, "logon");
 }
 
 static int _volume_key_in_keyring(struct crypt_device *_cd, int segment)
@@ -512,14 +528,20 @@ static int _volume_key_in_keyring(struct crypt_device *_cd, int segment)
 	return _kernel_key_by_segment(_cd, segment) >= 0 ? 0 : -1;
 }
 
-static int _drop_keyring_key(struct crypt_device *_cd, int segment)
+static int _drop_keyring_key_from_keyring_type(struct crypt_device *_cd, int segment,
+					       key_serial_t keyring, const char* type)
 {
-	key_serial_t kid = _kernel_key_by_segment(_cd, segment);
+	key_serial_t kid = _kernel_key_by_segment_and_type(_cd, segment, type);
 
 	if (kid < 0)
 		return -1;
 
-	return keyctl_unlink(kid, KEY_SPEC_THREAD_KEYRING);
+	return keyctl_unlink(kid, keyring);
+}
+
+static int _drop_keyring_key(struct crypt_device *_cd, int segment)
+{
+	return _drop_keyring_key_from_keyring_type(cd, segment, KEY_SPEC_THREAD_KEYRING, "logon");
 }
 #endif
 
@@ -537,6 +559,39 @@ static int test_open(struct crypt_device *_cd __attribute__((unused)),
 	*buffer_len = strlen(*buffer);
 
 	return 0;
+}
+
+static int test_open_pass(struct crypt_device *cd __attribute__((unused)),
+	int token __attribute__((unused)),
+	char **buffer,
+	size_t *buffer_len,
+	void *usrptr __attribute__((unused)))
+{
+	*buffer = strdup(PASSPHRASE);
+	if (!*buffer)
+		return -ENOMEM;
+	*buffer_len = strlen(*buffer);
+
+	return 0;
+}
+
+static int test_open_pass1(struct crypt_device *cd __attribute__((unused)),
+	int token __attribute__((unused)),
+	char **buffer,
+	size_t *buffer_len,
+	void *usrptr __attribute__((unused)))
+{
+	*buffer = strdup(PASSPHRASE1);
+	if (!*buffer)
+		return -ENOMEM;
+	*buffer_len = strlen(*buffer);
+
+	return 0;
+}
+
+static void test_token_free(void *ubffer __attribute__((unused)),
+		size_t buffer_len __attribute__((unused)))
+{
 }
 
 static int test_validate(struct crypt_device *_cd __attribute__((unused)), const char *json)
@@ -1925,6 +1980,10 @@ static void Tokens(void)
 #define LUKS2_KEYRING_TOKEN_JSON_BAD(x, y) "{\"type\":\"luks2-keyring\",\"keyslots\":[" x "]," \
 			"\"key_description\":" y ", \"some_field\":\"some_value\"}"
 
+#define TEST_TOKEN2_JSON(x) "{\"type\":\"test_token2\",\"keyslots\":[" x "] }"
+
+#define TEST_TOKEN3_JSON(x) "{\"type\":\"test_token3\",\"keyslots\":[" x "] }"
+
 
 	int ks, token_max;
 	const char *dummy;
@@ -1933,6 +1992,7 @@ static void Tokens(void)
 	char passptr[] = PASSPHRASE;
 	char passptr1[] = PASSPHRASE1;
 	struct crypt_active_device cad;
+	struct crypt_keyslot_context *kc;
 
 	static const crypt_token_handler th = {
 		.name = "test_token",
@@ -1948,6 +2008,14 @@ static void Tokens(void)
 	}, th_reserved = {
 		.name = "luks2-prefix",
 		.open = test_open
+	}, th4 = {
+		.name = "test_token2",
+		.open = test_open_pass, // PASSPHRASE
+		.buffer_free = test_token_free
+	}, th5 = {
+		.name = "test_token3",
+		.open = test_open_pass1, // PASSPHRASE1
+		.buffer_free = test_token_free
 	};
 
 	struct crypt_token_params_luks2_keyring params = {
@@ -2151,6 +2219,60 @@ static void Tokens(void)
 	OK_(crypt_get_active_device(cd, CDEVICE_1, &cad));
 	EQ_(0, cad.flags & CRYPT_ACTIVATE_SUSPENDED);
 	OK_(crypt_deactivate(cd, CDEVICE_1));
+	CRYPT_FREE(cd);
+
+	// test token based API with keyslot parameter
+	OK_(crypt_token_register(&th4)); // PASSPHRASE
+	OK_(crypt_token_register(&th5)); // PASSPHRASE1
+	OK_(crypt_init(&cd, DMDIR L_DEVICE_1S));
+	OK_(set_fast_pbkdf(cd));
+	OK_(crypt_format(cd, CRYPT_LUKS2, cipher, cipher_mode, NULL, NULL, 32, NULL));
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 0,  NULL, 32, PASSPHRASE, strlen(PASSPHRASE)), 0);
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 1,  NULL, 32, PASSPHRASE, strlen(PASSPHRASE)), 1);
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 2,  NULL, 32, PASSPHRASE, strlen(PASSPHRASE)), 2);
+
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 3,  NULL, 32, PASSPHRASE1, strlen(PASSPHRASE1)), 3);
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 4,  NULL, 32, PASSPHRASE1, strlen(PASSPHRASE1)), 4);
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 5,  NULL, 32, PASSPHRASE1, strlen(PASSPHRASE1)), 5);
+
+	OK_(crypt_keyslot_set_priority(cd, 0, CRYPT_SLOT_PRIORITY_IGNORE));
+	OK_(crypt_keyslot_set_priority(cd, 3, CRYPT_SLOT_PRIORITY_IGNORE));
+
+	OK_(crypt_keyslot_set_priority(cd, 2, CRYPT_SLOT_PRIORITY_PREFER));
+	OK_(crypt_keyslot_set_priority(cd, 5, CRYPT_SLOT_PRIORITY_PREFER));
+
+	EQ_(crypt_keyslot_add_by_key(cd, 6, NULL, 32, PASSPHRASE, strlen(PASSPHRASE), CRYPT_VOLUME_KEY_NO_SEGMENT), 6);
+	EQ_(crypt_keyslot_add_by_key(cd, 7, NULL, 32, PASSPHRASE1, strlen(PASSPHRASE1), CRYPT_VOLUME_KEY_NO_SEGMENT), 7);
+
+	OK_(crypt_keyslot_set_priority(cd, 6, CRYPT_SLOT_PRIORITY_PREFER));
+	OK_(crypt_keyslot_set_priority(cd, 7, CRYPT_SLOT_PRIORITY_PREFER));
+
+	EQ_(crypt_token_json_set(cd, 0, TEST_TOKEN2_JSON("\"0\", \"5\", \"1\", \"6\"")), 0); // PASSPHRASE
+	EQ_(crypt_token_json_set(cd, 1, TEST_TOKEN3_JSON("\"4\", \"6\", \"0\", \"5\"")), 1); // PASSPHRASE1
+
+	/* keyslots:
+	 *
+	 * 0 ingore (token 0)
+	 * 1 normal (token 0)
+	 * 2 prefer -
+	 * 3 ignore -
+	 * 4 normal (token 1)
+	 * 5 prefer (token 1, token 0 wrong passphrase)
+	 * 6 prefer (unbound, token 0, token 1 wrong passphrase)
+	 * 7 prefer (unbound)
+	 */
+
+	OK_(crypt_keyslot_context_init_by_token(cd, 0, NULL, NULL, 0, NULL, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 1);
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY), 6);
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, 7, kc, CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY), -ENOENT);
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, 5, kc, CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY), -EPERM);
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_token(cd, CRYPT_ANY_TOKEN, NULL, NULL, 0, NULL, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 5);
+	crypt_keyslot_context_free(kc);
+
 	CRYPT_FREE(cd);
 
 	EQ_(crypt_token_max(CRYPT_LUKS2), 32);
@@ -5020,6 +5142,226 @@ static void VolumeKeyGet(void)
 	_cleanup_dmdevices();
 }
 
+static void KeyslotContextAndKeyringLink(void)
+{
+#ifdef KERNEL_KEYRING
+	const char *cipher = "aes";
+	const char *cipher_mode = "xts-plain64";
+	struct crypt_keyslot_context *kc;
+	uint64_t r_payload_offset;
+	char key[128];
+	size_t key_size = 128;
+	key_serial_t kid, linked_kid;
+	int suspend_status;
+	struct crypt_active_device cad;
+	char key_description[1024];
+	char vk_buf[1024];
+	long vk_len;
+
+	OK_(get_luks2_offsets(0, 0, 0, NULL, &r_payload_offset));
+	OK_(create_dmdevice_over_loop(L_DEVICE_1S, r_payload_offset + 1));
+
+	// prepare the device
+	OK_(crypt_init(&cd, DMDIR L_DEVICE_1S));
+	OK_(set_fast_pbkdf(cd));
+	OK_(crypt_format(cd, CRYPT_LUKS2, cipher, cipher_mode, NULL, NULL, 32, NULL));
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 0, NULL, 32, PASSPHRASE, strlen(PASSPHRASE)), 0);
+	EQ_(crypt_keyslot_add_by_volume_key(cd, 1, NULL, 32, KEY1, strlen(KEY1)), 1);
+	EQ_(0, crypt_volume_key_get(cd, CRYPT_ANY_SLOT, key, &key_size, NULL, 0));
+
+	kid = add_key("user", KEY_DESC_TEST0, PASSPHRASE, strlen(PASSPHRASE), KEY_SPEC_THREAD_KEYRING);
+	NOTFAIL_(kid, "Test or kernel keyring are broken.");
+
+	// test passphrase
+	OK_(crypt_keyslot_context_init_by_passphrase(cd, PASSPHRASE, strlen(PASSPHRASE), &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 0);
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_passphrase(cd, KEY1, strlen(KEY1), &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 1);
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_volume_key(cd, key, key_size, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 0);
+	crypt_keyslot_context_free(kc);
+
+	OK_(prepare_keyfile(KEYFILE1, KEY1, strlen(KEY1)));
+	OK_(crypt_keyslot_context_init_by_keyfile(cd, KEYFILE1, 0, 0, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 1);
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_keyring(cd, KEY_DESC_TEST0, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, NULL, CRYPT_ANY_SLOT, kc, 0), 0);
+	crypt_keyslot_context_free(kc);
+
+	// test activation
+	OK_(crypt_keyslot_context_init_by_passphrase(cd, PASSPHRASE, strlen(PASSPHRASE), &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	FAIL_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), "already active");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_volume_key(cd, key, key_size, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	FAIL_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), "already active");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_keyfile(cd, KEYFILE1, 0, 0, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 1);
+	FAIL_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), "already active");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_keyring(cd, KEY_DESC_TEST0, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	// test linking to a keyring and setting key type
+	crypt_set_keyring_to_link(cd, "@u");
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_((linked_kid = _kernel_key_by_segment_and_type(cd, 0, "logon")), "VK was not linked to user keyring.");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(keyctl_unlink(linked_kid, KEY_SPEC_USER_KEYRING), "VK was not linked to user keyring after deactivation.");
+	FAIL_(keyctl_unlink(linked_kid, KEY_SPEC_USER_KEYRING), "VK was not unlinked linked from user keyring after deactivation.");
+
+	crypt_set_vk_keyring_type(cd, "user");
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_((linked_kid = _kernel_key_by_segment_and_type(cd, 0, "user")), "VK was not linked to user keyring.");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(keyctl_unlink(linked_kid, KEY_SPEC_USER_KEYRING), "VK was not linked to user keyring after deactivation.");
+	FAIL_(keyctl_unlink(linked_kid, KEY_SPEC_USER_KEYRING), "VK was not unlinked linked from user keyring after deactivation.");
+
+	crypt_set_keyring_to_link(cd, "@s");
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring.");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring after deactivation.");
+	OK_(_drop_keyring_key_from_keyring_type(cd, 0, KEY_SPEC_SESSION_KEYRING, "user"));
+
+	// test repated activation
+	FAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was still linked to session keyring after removal.");
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring after repeated activation.");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring after deactivation.");
+	OK_(_drop_keyring_key_from_keyring_type(cd, 0, KEY_SPEC_SESSION_KEYRING, "user"));
+	FAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "failed to unlink the key from session keyring");
+
+	// change key type to default (logon)
+	crypt_set_vk_keyring_type(cd, NULL);
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "logon"), "VK was not linked to session keyring after resetting key type.");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "logon"), "VK was not linked to session keyring after deactivation.");
+	OK_(_drop_keyring_key_from_keyring_type(cd, 0, KEY_SPEC_SESSION_KEYRING, "logon"));
+	FAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "failed to unlink the key from session keyring");
+
+	// disable linking to session keyring
+	crypt_set_keyring_to_link(cd, NULL);
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "logon"), "VK was not found in thread keyring");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	FAIL_(_kernel_key_by_segment_and_type(cd, 0, "logon"), "failed to unlink the key from thread keyring");
+
+	// link VK to keyring and re-activate by the linked VK
+	crypt_set_vk_keyring_type(cd, "user");
+	crypt_set_keyring_to_link(cd, "@s");
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring.");
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	OK_(snprintf(key_description, sizeof(key_description), "%%user:cryptsetup:%s-d0", crypt_get_uuid(cd)) < 1);
+	OK_(crypt_keyslot_context_init_by_vk_in_keyring(cd, key_description, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring after deactivation.");
+	OK_(_drop_keyring_key_from_keyring_type(cd, 0, KEY_SPEC_SESSION_KEYRING, "user"));
+	FAIL_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), "activation via VK in keyring after dropping the key");
+
+	// load VK back to keyring by activating
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+
+	// activate by bad VK in keyring (test if VK digest is verified)
+	NOTFAIL_((linked_kid = _kernel_key_by_segment_and_type(cd, 0, "user")), "VK was not linked to session keyring after activation.");
+	GE_((vk_len = keyctl_read(linked_kid, vk_buf, sizeof(vk_buf))), 0);
+	vk_buf[0] = ~vk_buf[0];
+	OK_(keyctl_update(linked_kid, vk_buf, vk_len));
+	FAIL_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	OK_(_drop_keyring_key_from_keyring_type(cd, 0, KEY_SPEC_SESSION_KEYRING, "user"));
+	crypt_keyslot_context_free(kc);
+
+	// After this point put resume tests only!
+	OK_(crypt_keyslot_context_init_by_passphrase(cd, PASSPHRASE, strlen(PASSPHRASE), &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	suspend_status = crypt_suspend(cd, CDEVICE_1);
+	if (suspend_status == -ENOTSUP) {
+		printf("WARNING: Suspend/Resume not supported, skipping test.\n");
+		OK_(crypt_deactivate(cd, CDEVICE_1));
+
+		NOTFAIL_(keyctl_unlink(kid, KEY_SPEC_THREAD_KEYRING), "Test or kernel keyring are broken.");
+		CRYPT_FREE(cd);
+		_cleanup_dmdevices();
+		return;
+	}
+	OK_(suspend_status);
+	OK_(crypt_get_active_device(cd, CDEVICE_1, &cad));
+	EQ_(CRYPT_ACTIVATE_SUSPENDED, cad.flags & CRYPT_ACTIVATE_SUSPENDED);
+	OK_(crypt_resume_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc));
+	OK_(crypt_get_active_device(cd, CDEVICE_1, &cad));
+	EQ_(0, cad.flags & CRYPT_ACTIVATE_SUSPENDED);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_volume_key(cd, key, key_size, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	OK_(crypt_suspend(cd, CDEVICE_1));
+	EQ_(crypt_resume_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc), 0);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_keyfile(cd, KEYFILE1, 0, 0, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 1);
+	OK_(crypt_suspend(cd, CDEVICE_1));
+	OK_(crypt_get_active_device(cd, CDEVICE_1, &cad));
+	EQ_(CRYPT_ACTIVATE_SUSPENDED, cad.flags & CRYPT_ACTIVATE_SUSPENDED);
+	EQ_(crypt_resume_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc), 1);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	OK_(crypt_keyslot_context_init_by_keyring(cd, KEY_DESC_TEST0, &kc));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	OK_(crypt_suspend(cd, CDEVICE_1));
+	EQ_(crypt_resume_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc), 0);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	crypt_keyslot_context_free(kc);
+
+	// resume by VK keyring context
+	crypt_set_vk_keyring_type(cd, "user");
+	crypt_set_keyring_to_link(cd, "@s");
+	OK_(crypt_activate_by_passphrase(cd, CDEVICE_1, CRYPT_ANY_SLOT, PASSPHRASE, strlen(PASSPHRASE), 0));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring.");
+	OK_(crypt_suspend(cd, CDEVICE_1));
+	OK_(snprintf(key_description, sizeof(key_description), "%%user:cryptsetup:%s-d0", crypt_get_uuid(cd)) < 1);
+	OK_(crypt_keyslot_context_init_by_vk_in_keyring(cd, key_description, &kc));
+	EQ_(crypt_resume_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc), 0);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	EQ_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), 0);
+	OK_(crypt_deactivate(cd, CDEVICE_1));
+	NOTFAIL_(_kernel_key_by_segment_and_type(cd, 0, "user"), "VK was not linked to session keyring after deactivation.");
+	OK_(_drop_keyring_key_from_keyring_type(cd, 0, KEY_SPEC_SESSION_KEYRING, "user"));
+	FAIL_(crypt_activate_by_keyslot_context(cd, CDEVICE_1, CRYPT_ANY_SLOT, kc, 0), "activation via VK in keyring after dropping the key");
+	crypt_keyslot_context_free(kc);
+
+	NOTFAIL_(keyctl_unlink(kid, KEY_SPEC_THREAD_KEYRING), "Test or kernel keyring are broken.");
+	CRYPT_FREE(cd);
+	_cleanup_dmdevices();
+#else
+	printf("WARNING: cryptsetup compiled with kernel keyring service disabled, skipping test.\n");
+#endif
+}
+
 static int _crypt_load_check(struct crypt_device *_cd)
 {
 #ifdef HAVE_BLKID
@@ -5147,6 +5489,7 @@ int main(int argc, char *argv[])
 #endif
 	RUN_(LuksKeyslotAdd, "Adding keyslot via new API");
 	RUN_(VolumeKeyGet, "Getting volume key via keyslot context API");
+	RUN_(KeyslotContextAndKeyringLink, "Activate via keyslot context API and linking VK to a keyring");
 	RUN_(Luks2Repair, "LUKS2 repair"); // test disables metadata locking. Run always last!
 
 	_cleanup();

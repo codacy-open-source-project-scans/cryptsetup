@@ -60,6 +60,10 @@ struct crypt_device {
 	/* global context scope settings */
 	unsigned key_in_keyring:1;
 
+	bool link_vk_to_keyring;
+	int32_t keyring_to_link_vk;
+	key_type_t keyring_key_type;
+
 	uint64_t data_offset;
 	uint64_t metadata_size; /* Used in LUKS2 format */
 	uint64_t keyslots_size; /* Used in LUKS2 format */
@@ -3936,7 +3940,7 @@ int crypt_suspend(struct crypt_device *cd,
 		goto out;
 	}
 
-	crypt_drop_keyring_key_by_description(cd, key_desc, LOGON_KEY);
+	crypt_drop_keyring_key_by_description(cd, key_desc, cd->keyring_key_type);
 
 	if (dm_opal_uuid && (!crypt_data_device(cd) || opal_lock(cd, crypt_data_device(cd), opal_segment_number)))
 		log_err(cd, _("Device %s was suspended but hardware OPAL device cannot be locked."), name);
@@ -4078,21 +4082,19 @@ static int resume_by_volume_key(struct crypt_device *cd,
 	return -EINVAL;
 }
 
-int crypt_resume_by_passphrase(struct crypt_device *cd,
+int crypt_resume_by_keyslot_context(struct crypt_device *cd,
 			       const char *name,
 			       int keyslot,
-			       const char *passphrase,
-			       size_t passphrase_size)
+			       struct crypt_keyslot_context *kc)
 {
-	struct volume_key *vk = NULL;
 	int r;
+	struct volume_key *vk = NULL;
+	int unlocked_keyslot = -EINVAL;
 
-	/* FIXME: check context uuid matches the dm-crypt device uuid */
-
-	if (!passphrase || !name)
+	if (!name)
 		return -EINVAL;
 
-	log_dbg(cd, "Resuming volume %s.", name);
+	log_dbg(cd, "Resuming volume %s [keyslot %d] using %s.", name, keyslot, keyslot_context_type_string(kc));
 
 	if ((r = onlyLUKS(cd)))
 		return r;
@@ -4106,24 +4108,50 @@ int crypt_resume_by_passphrase(struct crypt_device *cd,
 		return -EINVAL;
 	}
 
+	if (isLUKS1(cd->type) && kc->get_luks1_volume_key)
+		r = kc->get_luks1_volume_key(cd, kc, keyslot, &vk);
+	else if (isLUKS2(cd->type) && kc->get_luks2_volume_key)
+		r = kc->get_luks2_volume_key(cd, kc, keyslot, &vk);
+	else
+		r = -EINVAL;
+	if (r < 0)
+		goto out;
+	unlocked_keyslot = r;
+
 	if (isLUKS1(cd->type)) {
-		r = LUKS_open_key_with_hdr(keyslot, passphrase, passphrase_size,
-					   &cd->u.luks1.hdr, &vk, cd);
-		if (r >= 0)
-			crypt_volume_key_set_id(vk, 0);
-
+		r = LUKS_verify_volume_key(&cd->u.luks1.hdr, vk);
+		crypt_volume_key_set_id(vk, 0);
+	} else if (isLUKS2(cd->type)) {
+		r = LUKS2_digest_verify_by_segment(cd, &cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT, vk);
+		crypt_volume_key_set_id(vk, 0);
 	} else
-		r = LUKS2_keyslot_open(cd, keyslot, CRYPT_DEFAULT_SEGMENT, passphrase, passphrase_size, &vk);
-
-	if  (r < 0)
-		return r;
-
-	keyslot = r;
+		r = -EINVAL;
+	if (r < 0)
+		goto out;
 
 	r = resume_by_volume_key(cd, vk, name);
 
 	crypt_free_volume_key(vk);
-	return r < 0 ? r : keyslot;
+	return r < 0 ? r : unlocked_keyslot;
+out:
+	crypt_free_volume_key(vk);
+	return r;
+}
+
+int crypt_resume_by_passphrase(struct crypt_device *cd,
+			       const char *name,
+			       int keyslot,
+			       const char *passphrase,
+			       size_t passphrase_size)
+{
+	int r;
+	struct crypt_keyslot_context kc;
+
+	crypt_keyslot_unlock_by_passphrase_init_internal(&kc, passphrase, passphrase_size);
+	r = crypt_resume_by_keyslot_context(cd, name, keyslot, &kc);
+	crypt_keyslot_context_destroy_internal(&kc);
+
+	return r;
 }
 
 int crypt_resume_by_keyfile_device_offset(struct crypt_device *cd,
@@ -4133,55 +4161,14 @@ int crypt_resume_by_keyfile_device_offset(struct crypt_device *cd,
 					  size_t keyfile_size,
 					  uint64_t keyfile_offset)
 {
-	struct volume_key *vk = NULL;
-	char *passphrase_read = NULL;
-	size_t passphrase_size_read;
 	int r;
+	struct crypt_keyslot_context kc;
 
-	/* FIXME: check context uuid matches the dm-crypt device uuid */
+	crypt_keyslot_unlock_by_keyfile_init_internal(&kc, keyfile, keyfile_size, keyfile_offset);
+	r = crypt_resume_by_keyslot_context(cd, name, keyslot, &kc);
+	crypt_keyslot_context_destroy_internal(&kc);
 
-	if (!name || !keyfile)
-		return -EINVAL;
-
-	log_dbg(cd, "Resuming volume %s.", name);
-
-	if ((r = onlyLUKS(cd)))
-		return r;
-
-	r = dm_status_suspended(cd, name);
-	if (r < 0)
-		return r;
-
-	if (!r) {
-		log_err(cd, _("Volume %s is not suspended."), name);
-		return -EINVAL;
-	}
-
-	r = crypt_keyfile_device_read(cd, keyfile,
-				      &passphrase_read, &passphrase_size_read,
-				      keyfile_offset, keyfile_size, 0);
-	if (r < 0)
-		return r;
-
-	if (isLUKS1(cd->type)) {
-		r = LUKS_open_key_with_hdr(keyslot, passphrase_read, passphrase_size_read,
-					   &cd->u.luks1.hdr, &vk, cd);
-		if (r >= 0)
-			crypt_volume_key_set_id(vk, 0);
-	} else
-		r = LUKS2_keyslot_open(cd, keyslot, CRYPT_DEFAULT_SEGMENT,
-				       passphrase_read, passphrase_size_read, &vk);
-
-	crypt_safe_free(passphrase_read);
-	if (r < 0)
-		return r;
-
-	keyslot = r;
-
-	r = resume_by_volume_key(cd, vk, name);
-
-	crypt_free_volume_key(vk);
-	return r < 0 ? r : keyslot;
+	return r;
 }
 
 int crypt_resume_by_keyfile(struct crypt_device *cd,
@@ -4210,46 +4197,16 @@ int crypt_resume_by_volume_key(struct crypt_device *cd,
 	const char *volume_key,
 	size_t volume_key_size)
 {
-	struct volume_key *vk = NULL;
 	int r;
+	struct crypt_keyslot_context kc;
 
-	if (!name || !volume_key)
-		return -EINVAL;
+	crypt_keyslot_unlock_by_key_init_internal(&kc, volume_key, volume_key_size);
+	r = crypt_resume_by_keyslot_context(cd, name, CRYPT_ANY_SLOT /* unused */, &kc);
+	crypt_keyslot_context_destroy_internal(&kc);
 
-	log_dbg(cd, "Resuming volume %s by volume key.", name);
-
-	if ((r = onlyLUKS(cd)))
-		return r;
-
-	r = dm_status_suspended(cd, name);
-	if (r < 0)
-		return r;
-
-	if (!r) {
-		log_err(cd, _("Volume %s is not suspended."), name);
-		return -EINVAL;
-	}
-
-	vk = crypt_alloc_volume_key(volume_key_size, volume_key);
-	if (!vk)
-		return -ENOMEM;
-
-	if (isLUKS1(cd->type)) {
-		r = LUKS_verify_volume_key(&cd->u.luks1.hdr, vk);
-		if (r >= 0)
-			crypt_volume_key_set_id(vk, 0);
-	} else if (isLUKS2(cd->type)) {
-		r = LUKS2_digest_verify_by_segment(cd, &cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT, vk);
-		crypt_volume_key_set_id(vk, r);
-	} else
-		r = -EINVAL;
 	if (r == -EPERM || r == -ENOENT)
 		log_err(cd, _("Volume key does not match the volume."));
 
-	if (r >= 0)
-		r = resume_by_volume_key(cd, vk, name);
-
-	crypt_free_volume_key(vk);
 	return r;
 }
 
@@ -4257,35 +4214,14 @@ int crypt_resume_by_token_pin(struct crypt_device *cd, const char *name,
 	const char *type, int token, const char *pin, size_t pin_size,
 	void *usrptr)
 {
-	struct volume_key *vk = NULL;
-	int r, keyslot;
+	int r;
+	struct crypt_keyslot_context kc;
 
-	if (!name)
-		return -EINVAL;
+	crypt_keyslot_unlock_by_token_init_internal(&kc, token, type, pin, pin_size, usrptr);
+	r = crypt_resume_by_keyslot_context(cd, name, CRYPT_ANY_SLOT, &kc);
+	crypt_keyslot_context_destroy_internal(&kc);
 
-	log_dbg(cd, "Resuming volume %s by token (%s type) %d.",
-		name, type ?: "any", token);
-
-	if ((r = _onlyLUKS2(cd, CRYPT_CD_QUIET, 0)))
-		return r;
-
-	r = dm_status_suspended(cd, name);
-	if (r < 0)
-		return r;
-
-	if (!r) {
-		log_err(cd, _("Volume %s is not suspended."), name);
-		return -EINVAL;
-	}
-
-	r = LUKS2_token_unlock_key(cd, &cd->u.luks2.hdr, token, type,
-				   pin, pin_size, CRYPT_DEFAULT_SEGMENT, usrptr, &vk);
-	keyslot = r;
-	if (r >= 0)
-		r = resume_by_volume_key(cd, vk, name);
-
-	crypt_free_volume_key(vk);
-	return r < 0 ? r : keyslot;
+	return r;
 }
 
 /*
@@ -5070,16 +5006,23 @@ out:
 
 static int _activate_loopaes(struct crypt_device *cd,
 	const char *name,
-	char *buffer,
+	const char *buffer,
 	size_t buffer_size,
 	uint32_t flags)
 {
 	int r;
 	unsigned int key_count = 0;
 	struct volume_key *vk = NULL;
+	char *buffer_copy;
+
+	buffer_copy = crypt_safe_alloc(buffer_size);
+	if (!buffer_copy)
+		return -ENOMEM;
+	memcpy(buffer_copy, buffer, buffer_size);
 
 	r = LOOPAES_parse_keyfile(cd, &vk, cd->u.loopaes.hdr.hash, &key_count,
-				  buffer, buffer_size);
+				  buffer_copy, buffer_size);
+	crypt_safe_free(buffer_copy);
 
 	if (!r && name)
 		r = LOOPAES_activate(cd, name, cd->u.loopaes.cipher, key_count,
@@ -5114,7 +5057,271 @@ static int _activate_check_status(struct crypt_device *cd, const char *name, uns
 	return r;
 }
 
-// activation/deactivation of device mapping
+static int _verify_key(struct crypt_device *cd,
+	int segment,
+	struct volume_key *vk)
+{
+	int r = -EINVAL;
+
+	assert(cd);
+
+	if (isPLAIN(cd->type)) {
+		if (vk && vk->keylength == cd->u.plain.key_size) {
+			r = KEY_VERIFIED;
+		} else
+			log_err(cd, _("Incorrect volume key specified for plain device."));
+	} else if (isLUKS1(cd->type)) {
+		r = LUKS_verify_volume_key(&cd->u.luks1.hdr, vk);
+		if (r == -EPERM)
+			log_err(cd, _("Volume key does not match the volume."));
+	} else if (isLUKS2(cd->type)) {
+		if (segment == CRYPT_ANY_SEGMENT)
+			r = LUKS2_digest_any_matching(cd, &cd->u.luks2.hdr, vk);
+		else {
+			r = LUKS2_digest_verify_by_segment(cd, &cd->u.luks2.hdr, segment, vk);
+			if (r == -EPERM || r == -ENOENT)
+				log_err(cd, _("Volume key does not match the volume."));
+		}
+	} else if (isVERITY(cd->type))
+		r = KEY_VERIFIED;
+	else if (isTCRYPT(cd->type))
+		r = KEY_VERIFIED;
+	else if (isINTEGRITY(cd->type))
+		r = KEY_VERIFIED;
+	else if (isBITLK(cd->type))
+		r = KEY_VERIFIED;
+	else
+		log_err(cd, _("Device type is not properly initialized."));
+
+	if (r >= KEY_VERIFIED)
+		crypt_volume_key_set_id(vk, r);
+
+	return r > 0 ? 0 : r;
+}
+
+/* activation/deactivation of device mapping */
+static int _activate_by_volume_key(struct crypt_device *cd,
+	const char *name,
+	struct volume_key *vk,
+	struct volume_key *external_key,
+	uint32_t flags)
+{
+	int r;
+
+	assert(cd);
+	assert(name);
+
+	r = _check_header_data_overlap(cd, name);
+	if (r < 0)
+		return r;
+
+	/* use key directly, no hash */
+	if (isPLAIN(cd->type)) {
+		assert(!external_key);
+		assert(crypt_volume_key_get_id(vk) == KEY_VERIFIED);
+
+		r = PLAIN_activate(cd, name, vk, cd->u.plain.hdr.size, flags);
+	} else if (isLUKS1(cd->type)) {
+		assert(!external_key);
+		assert(crypt_volume_key_get_id(vk) == KEY_VERIFIED);
+
+		r = LUKS1_activate(cd, name, vk, flags);
+	} else if (isLUKS2(cd->type)) {
+		assert(crypt_volume_key_get_id(vk) == LUKS2_digest_by_segment(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT));
+		r = LUKS2_activate(cd, name, vk, external_key, flags);
+	} else if (isVERITY(cd->type)) {
+		assert(crypt_volume_key_get_id(vk) == KEY_VERIFIED);
+		r = VERITY_activate(cd, name, vk, external_key, cd->u.verity.fec_device,
+				    &cd->u.verity.hdr, flags);
+	} else if (isTCRYPT(cd->type)) {
+		assert(!external_key);
+		r = TCRYPT_activate(cd, name, &cd->u.tcrypt.hdr,
+				    &cd->u.tcrypt.params, flags);
+	} else if (isINTEGRITY(cd->type)) {
+		assert(!external_key);
+		assert(!vk || crypt_volume_key_get_id(vk) == KEY_VERIFIED);
+		r = INTEGRITY_activate(cd, name, &cd->u.integrity.params, vk,
+				       cd->u.integrity.journal_crypt_key,
+				       cd->u.integrity.journal_mac_key, flags,
+				       cd->u.integrity.sb_flags);
+	} else if (isBITLK(cd->type)) {
+		assert(!external_key);
+		r = BITLK_activate_by_volume_key(cd, name, vk->key, vk->keylength,
+						 &cd->u.bitlk.params, flags);
+	} else {
+		log_err(cd, _("Device type is not properly initialized."));
+		r = -EINVAL;
+	}
+
+	return r;
+}
+
+int crypt_activate_by_keyslot_context(struct crypt_device *cd,
+	const char *name,
+	int keyslot,
+	struct crypt_keyslot_context *kc,
+	uint32_t flags)
+{
+	bool use_keyring;
+	struct volume_key *p_ext_key, *crypt_key = NULL, *opal_key = NULL, *vk = NULL,
+		*vk_sign = NULL, *p_crypt = NULL;
+	size_t passphrase_size;
+	const char *passphrase = NULL;
+	int unlocked_keyslot, r = -EINVAL;
+
+	log_dbg(cd, "%s volume %s [keyslot %d] using %s.",
+		name ? "Activating" : "Checking", name ?: "passphrase", keyslot, keyslot_context_type_string(kc));
+
+	if (!cd || !kc)
+		return -EINVAL;
+	if (!name && (flags & CRYPT_ACTIVATE_REFRESH))
+		return -EINVAL;
+	if ((flags & CRYPT_ACTIVATE_KEYRING_KEY) && !crypt_use_keyring_for_vk(cd))
+		return -EINVAL;
+	if ((flags & CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY) && name)
+		return -EINVAL;
+	if ((kc->type == CRYPT_KC_TYPE_KEYRING) && !kernel_keyring_support()) {
+		log_err(cd, _("Kernel keyring is not supported by the kernel."));
+		return -EINVAL;
+	}
+	if ((kc->type == CRYPT_KC_TYPE_SIGNED_KEY) && !kernel_keyring_support()) {
+		log_err(cd, _("Kernel keyring missing: required for passing signature to kernel."));
+		return -EINVAL;
+	}
+	r = _check_header_data_overlap(cd, name);
+	if (r < 0)
+		return r;
+	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
+	if (r < 0)
+		return r;
+
+	/* for TCRYPT and token skip passphrase activation */
+	if (kc->get_passphrase && kc->type != CRYPT_KC_TYPE_TOKEN && !isTCRYPT(cd->type)) {
+		r = kc->get_passphrase(cd, kc, &passphrase, &passphrase_size);
+		if (r < 0)
+			return r;
+		/* TODO: Only loopaes should by activated by passphrase method */
+		if (passphrase) {
+			if (isLOOPAES(cd->type))
+				return _activate_loopaes(cd, name, passphrase, passphrase_size, flags);
+			else
+				return _activate_by_passphrase(cd, name, keyslot, passphrase, passphrase_size, flags);
+		}
+	}
+	/* only passphrase unlock is supported with loopaes */
+	if (isLOOPAES(cd->type))
+		return -EINVAL;
+
+	/* activate by volume key */
+	r = -EINVAL;
+	if (isLUKS1(cd->type)) {
+		if (kc->get_luks1_volume_key)
+			r = kc->get_luks1_volume_key(cd, kc, keyslot, &vk);
+	} else if (isLUKS2(cd->type)) {
+		if (flags & CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY && kc->get_luks2_key)
+			r = kc->get_luks2_key(cd, kc, keyslot, CRYPT_ANY_SEGMENT, &vk);
+		else if (kc->get_luks2_volume_key)
+			r = kc->get_luks2_volume_key(cd, kc, keyslot, &vk);
+	} else if (isTCRYPT(cd->type)) {
+		r = 0;
+	} else if (name && isPLAIN(cd->type)) {
+		if (kc->get_plain_volume_key)
+			r = kc->get_plain_volume_key(cd, kc, &vk);
+	} else if (name && isBITLK(cd->type)) {
+		if (kc->get_bitlk_volume_key)
+			r = kc->get_bitlk_volume_key(cd, kc, &vk);
+	} else if (isFVAULT2(cd->type)) {
+		if (kc->get_fvault2_volume_key)
+			r = kc->get_fvault2_volume_key(cd, kc, &vk);
+	} else if (isVERITY(cd->type) && (name || kc->type != CRYPT_KC_TYPE_SIGNED_KEY)) {
+		if (kc->get_verity_volume_key)
+			r = kc->get_verity_volume_key(cd, kc, &vk, &vk_sign);
+		if (r >= 0)
+			r = VERITY_verify_params(cd, &cd->u.verity.hdr, vk_sign != NULL,
+						 cd->u.verity.fec_device, vk);
+
+		free(CONST_CAST(void*)cd->u.verity.root_hash);
+		cd->u.verity.root_hash = NULL;
+		flags |= CRYPT_ACTIVATE_READONLY;
+	} else if (isINTEGRITY(cd->type)) {
+		if (kc->get_integrity_volume_key)
+			r = kc->get_integrity_volume_key(cd, kc, &vk);
+	}
+	if (r < 0 && (r != -ENOENT || kc->type == CRYPT_KC_TYPE_TOKEN))
+		goto out;
+	unlocked_keyslot = r;
+
+	if (r == -ENOENT && isLUKS(cd->type) && cd->volume_key) {
+		vk = crypt_alloc_volume_key(cd->volume_key->keylength, cd->volume_key->key);
+		r = vk ? 0 : -ENOMEM;
+	}
+	if (r == -ENOENT && isINTEGRITY(cd->type))
+		r = 0;
+
+	if (r < 0)
+		goto out;
+
+	r = _verify_key(cd,
+			flags & CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY ? CRYPT_ANY_SEGMENT : CRYPT_DEFAULT_SEGMENT,
+			vk);
+
+	if (r < 0)
+		goto out;
+
+	if (isLUKS2(cd->type)) {
+		if (LUKS2_segment_is_hw_opal(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT)) {
+			r = LUKS2_split_crypt_and_opal_keys(cd, &cd->u.luks2.hdr,
+							    vk, &crypt_key,
+							    &opal_key);
+			if (r < 0)
+				goto out;
+
+			/* copy volume key digest id in crypt subkey */
+			crypt_volume_key_set_id(crypt_key, crypt_volume_key_get_id(vk));
+
+			p_crypt = crypt_key;
+			p_ext_key = opal_key ?: vk;
+		} else {
+			p_crypt = vk;
+			p_ext_key = NULL;
+		}
+
+		if (!crypt_use_keyring_for_vk(cd) || !p_crypt)
+			use_keyring = false;
+		else
+			use_keyring = (name && !crypt_is_cipher_null(crypt_get_cipher(cd))) ||
+				      (flags & CRYPT_ACTIVATE_KEYRING_KEY);
+
+		if (use_keyring) {
+			r = LUKS2_key_description_by_segment(cd, &cd->u.luks2.hdr, p_crypt, CRYPT_DEFAULT_SEGMENT);
+			if (r < 0)
+				goto out;
+			r = crypt_volume_key_load_in_keyring(cd, p_crypt);
+			if (r < 0)
+				goto out;
+			flags |= CRYPT_ACTIVATE_KEYRING_KEY;
+		}
+	} else {
+		p_crypt = vk;
+		p_ext_key = vk_sign;
+	}
+
+	if (name)
+		r = _activate_by_volume_key(cd, name, p_crypt, p_ext_key, flags);
+
+	if (r >= 0 && unlocked_keyslot >= 0)
+		r = unlocked_keyslot;
+out:
+	if (r < 0)
+		crypt_drop_keyring_key(cd, p_crypt);
+
+	crypt_free_volume_key(vk);
+	crypt_free_volume_key(crypt_key);
+	crypt_free_volume_key(opal_key);
+	crypt_free_volume_key(vk_sign);
+	return r;
+}
+
 int crypt_activate_by_passphrase(struct crypt_device *cd,
 	const char *name,
 	int keyslot,
@@ -5123,19 +5330,13 @@ int crypt_activate_by_passphrase(struct crypt_device *cd,
 	uint32_t flags)
 {
 	int r;
+	struct crypt_keyslot_context kc;
 
-	if (!cd || !passphrase || (!name && (flags & CRYPT_ACTIVATE_REFRESH)))
-		return -EINVAL;
+	crypt_keyslot_unlock_by_passphrase_init_internal(&kc, passphrase, passphrase_size);
+	r = crypt_activate_by_keyslot_context(cd, name, keyslot, &kc, flags);
+	crypt_keyslot_context_destroy_internal(&kc);
 
-	log_dbg(cd, "%s volume %s [keyslot %d] using passphrase.",
-		name ? "Activating" : "Checking", name ?: "passphrase",
-		keyslot);
-
-	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
-	if (r < 0)
-		return r;
-
-	return _activate_by_passphrase(cd, name, keyslot, passphrase, passphrase_size, flags);
+	return r;
 }
 
 int crypt_activate_by_keyfile_device_offset(struct crypt_device *cd,
@@ -5146,34 +5347,13 @@ int crypt_activate_by_keyfile_device_offset(struct crypt_device *cd,
 	uint64_t keyfile_offset,
 	uint32_t flags)
 {
-	char *passphrase_read = NULL;
-	size_t passphrase_size_read;
 	int r;
+	struct crypt_keyslot_context kc;
 
-	if (!cd || !keyfile ||
-	    ((flags & CRYPT_ACTIVATE_KEYRING_KEY) && !crypt_use_keyring_for_vk(cd)))
-		return -EINVAL;
+	crypt_keyslot_unlock_by_keyfile_init_internal(&kc, keyfile, keyfile_size, keyfile_offset);
+	r = crypt_activate_by_keyslot_context(cd, name, keyslot, &kc, flags);
+	crypt_keyslot_context_destroy_internal(&kc);
 
-	log_dbg(cd, "%s volume %s [keyslot %d] using keyfile %s.",
-		name ? "Activating" : "Checking", name ?: "passphrase", keyslot, keyfile);
-
-	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
-	if (r < 0)
-		return r;
-
-	r = crypt_keyfile_device_read(cd, keyfile,
-				&passphrase_read, &passphrase_size_read,
-				keyfile_offset, keyfile_size, 0);
-	if (r < 0)
-		goto out;
-
-	if (isLOOPAES(cd->type))
-		r = _activate_loopaes(cd, name, passphrase_read, passphrase_size_read, flags);
-	else
-		r = _activate_by_passphrase(cd, name, keyslot, passphrase_read, passphrase_size_read, flags);
-
-out:
-	crypt_safe_free(passphrase_read);
 	return r;
 }
 
@@ -5199,156 +5379,19 @@ int crypt_activate_by_keyfile_offset(struct crypt_device *cd,
 	return crypt_activate_by_keyfile_device_offset(cd, name, keyslot, keyfile,
 					keyfile_size, keyfile_offset, flags);
 }
+
 int crypt_activate_by_volume_key(struct crypt_device *cd,
 	const char *name,
 	const char *volume_key,
 	size_t volume_key_size,
 	uint32_t flags)
 {
-	bool use_keyring;
-	struct volume_key *p_opal, *crypt_key = NULL, *opal_key = NULL, *vk = NULL, *p_crypt = NULL;
 	int r;
+	struct crypt_keyslot_context kc;
 
-	if (!cd ||
-	    ((flags & CRYPT_ACTIVATE_KEYRING_KEY) && !crypt_use_keyring_for_vk(cd)))
-		return -EINVAL;
-
-	log_dbg(cd, "%s volume %s by volume key.", name ? "Activating" : "Checking",
-		name ?: "");
-
-	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
-	if (r < 0)
-		return r;
-
-	r = _check_header_data_overlap(cd, name);
-	if (r < 0)
-		return r;
-
-	/* use key directly, no hash */
-	if (isPLAIN(cd->type)) {
-		if (!name)
-			return -EINVAL;
-
-		if (!volume_key || !volume_key_size || volume_key_size != cd->u.plain.key_size) {
-			log_err(cd, _("Incorrect volume key specified for plain device."));
-			return -EINVAL;
-		}
-
-		vk = crypt_alloc_volume_key(volume_key_size, volume_key);
-		if (!vk)
-			return -ENOMEM;
-
-		r = PLAIN_activate(cd, name, vk, cd->u.plain.hdr.size, flags);
-	} else if (isLUKS1(cd->type)) {
-		/* If key is not provided, try to use internal key */
-		if (!volume_key) {
-			if (!cd->volume_key) {
-				log_err(cd, _("Volume key does not match the volume."));
-				return -EINVAL;
-			}
-			volume_key_size = cd->volume_key->keylength;
-			volume_key = cd->volume_key->key;
-		}
-
-		vk = crypt_alloc_volume_key(volume_key_size, volume_key);
-		if (!vk)
-			return -ENOMEM;
-		r = LUKS_verify_volume_key(&cd->u.luks1.hdr, vk);
-
-		if (r == -EPERM)
-			log_err(cd, _("Volume key does not match the volume."));
-
-		if (!r && name)
-			r = LUKS1_activate(cd, name, vk, flags);
-	} else if (isLUKS2(cd->type)) {
-		/* If key is not provided, try to use internal key */
-		if (!volume_key) {
-			if (!cd->volume_key) {
-				log_err(cd, _("Volume key does not match the volume."));
-				return -EINVAL;
-			}
-			volume_key_size = cd->volume_key->keylength;
-			volume_key = cd->volume_key->key;
-		}
-
-		vk = crypt_alloc_volume_key(volume_key_size, volume_key);
-		if (!vk)
-			return -ENOMEM;
-
-		r = LUKS2_digest_verify_by_segment(cd, &cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT, vk);
-		if (r == -EPERM || r == -ENOENT)
-			log_err(cd, _("Volume key does not match the volume."));
-		if (r > 0)
-			r = 0;
-
-		if (LUKS2_segment_is_hw_opal(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT)) {
-			r = LUKS2_split_crypt_and_opal_keys(cd, &cd->u.luks2.hdr,
-							    vk, &crypt_key,
-							    &opal_key);
-			if (r < 0) {
-				crypt_free_volume_key(vk);
-				return r;
-			}
-
-			p_crypt = crypt_key;
-			p_opal = opal_key ?: vk;
-		} else {
-			p_crypt = vk;
-			p_opal = NULL;
-		}
-
-		if (!crypt_use_keyring_for_vk(cd) || !p_crypt)
-			use_keyring = false;
-		else
-			use_keyring = (name && !crypt_is_cipher_null(crypt_get_cipher(cd))) ||
-				      (flags & CRYPT_ACTIVATE_KEYRING_KEY);
-
-		if (!r && use_keyring) {
-			r = LUKS2_key_description_by_segment(cd,
-				&cd->u.luks2.hdr, p_crypt, CRYPT_DEFAULT_SEGMENT);
-			if (!r)
-				r = crypt_volume_key_load_in_keyring(cd, p_crypt);
-			if (!r)
-				flags |= CRYPT_ACTIVATE_KEYRING_KEY;
-		}
-
-		if (!r && name)
-			r = LUKS2_activate(cd, name, p_crypt, p_opal, flags);
-	} else if (isVERITY(cd->type)) {
-		r = crypt_activate_by_signed_key(cd, name, volume_key, volume_key_size, NULL, 0, flags);
-	} else if (isTCRYPT(cd->type)) {
-		if (!name)
-			return 0;
-		r = TCRYPT_activate(cd, name, &cd->u.tcrypt.hdr,
-				    &cd->u.tcrypt.params, flags);
-	} else if (isINTEGRITY(cd->type)) {
-		if (!name)
-			return 0;
-		if (volume_key) {
-			vk = crypt_alloc_volume_key(volume_key_size, volume_key);
-			if (!vk)
-				return -ENOMEM;
-		}
-		r = INTEGRITY_activate(cd, name, &cd->u.integrity.params, vk,
-				       cd->u.integrity.journal_crypt_key,
-				       cd->u.integrity.journal_mac_key, flags,
-				       cd->u.integrity.sb_flags);
-	} else if (isBITLK(cd->type)) {
-		if (!name)
-			return -EINVAL;
-		r = BITLK_activate_by_volume_key(cd, name, volume_key, volume_key_size,
-						 &cd->u.bitlk.params, flags);
-	} else {
-		log_err(cd, _("Device type is not properly initialized."));
-		r = -EINVAL;
-	}
-
-	if (r < 0)
-		crypt_drop_keyring_key(cd, p_crypt);
-
-	crypt_free_volume_key(vk);
-	crypt_free_volume_key(crypt_key);
-	crypt_free_volume_key(opal_key);
+	crypt_keyslot_unlock_by_key_init_internal(&kc, volume_key, volume_key_size);
+	r = crypt_activate_by_keyslot_context(cd, name, CRYPT_ANY_SLOT /* unused */, &kc, flags);
+	crypt_keyslot_context_destroy_internal(&kc);
 
 	return r;
 }
@@ -5361,8 +5404,8 @@ int crypt_activate_by_signed_key(struct crypt_device *cd,
 	size_t signature_size,
 	uint32_t flags)
 {
-	char description[512];
 	int r;
+	struct crypt_keyslot_context kc;
 
 	if (!cd || !isVERITY(cd->type))
 		return -EINVAL;
@@ -5372,57 +5415,13 @@ int crypt_activate_by_signed_key(struct crypt_device *cd,
 		return -EINVAL;
 	}
 
-	if (name)
-		log_dbg(cd, "Activating volume %s by %skey.", name, signature ? "signed " : "");
-	else
-		log_dbg(cd, "Checking volume by key.");
-
-	if (cd->u.verity.hdr.flags & CRYPT_VERITY_ROOT_HASH_SIGNATURE && !signature) {
-		log_err(cd, _("Root hash signature required."));
-		return -EINVAL;
-	}
-
-	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
-	if (r < 0)
-		return r;
-
-	if (signature && !kernel_keyring_support()) {
-		log_err(cd, _("Kernel keyring missing: required for passing signature to kernel."));
-		return -EINVAL;
-	}
-
-	/* volume_key == root hash */
-	free(CONST_CAST(void*)cd->u.verity.root_hash);
-	cd->u.verity.root_hash = NULL;
-
-	if (signature) {
-		r = snprintf(description, sizeof(description)-1, "cryptsetup:%s%s%s",
-			     crypt_get_uuid(cd) ?: "", crypt_get_uuid(cd) ? "-" : "", name);
-		if (r < 0)
-			return -EINVAL;
-
-		log_dbg(cd, "Adding signature into keyring %s", description);
-		r = keyring_add_key_in_thread_keyring(USER_KEY, description, signature, signature_size);
-		if (r) {
-			log_err(cd, _("Failed to load key in kernel keyring."));
-			return r;
-		}
-	}
-
-	r = VERITY_activate(cd, name, volume_key, volume_key_size,
-			    signature ? description : NULL,
-			    cd->u.verity.fec_device,
-			    &cd->u.verity.hdr, flags | CRYPT_ACTIVATE_READONLY);
-
-	if (!r) {
-		cd->u.verity.root_hash_size = volume_key_size;
-		cd->u.verity.root_hash = malloc(volume_key_size);
-		if (cd->u.verity.root_hash)
-			memcpy(CONST_CAST(void*)cd->u.verity.root_hash, volume_key, volume_key_size);
-	}
-
 	if (signature)
-		crypt_drop_keyring_key_by_description(cd, description, USER_KEY);
+		crypt_keyslot_unlock_by_signed_key_init_internal(&kc, volume_key, volume_key_size,
+			signature, signature_size);
+	else
+		crypt_keyslot_unlock_by_key_init_internal(&kc, volume_key, volume_key_size);
+	r = crypt_activate_by_keyslot_context(cd, name, -2 /* unused */, &kc, flags);
+	crypt_keyslot_context_destroy_internal(&kc);
 
 	return r;
 }
@@ -6618,26 +6617,13 @@ int crypt_activate_by_token_pin(struct crypt_device *cd, const char *name,
 	void *usrptr, uint32_t flags)
 {
 	int r;
+	struct crypt_keyslot_context kc;
 
-	log_dbg(cd, "%s volume %s using token (%s type) %d.",
-		name ? "Activating" : "Checking", name ?: "passphrase",
-		type ?: "any", token);
+	crypt_keyslot_unlock_by_token_init_internal(&kc, token, type, pin, pin_size, usrptr);
+	r = crypt_activate_by_keyslot_context(cd, name, CRYPT_ANY_SLOT, &kc, flags);
+	crypt_keyslot_context_destroy_internal(&kc);
 
-	if ((r = _onlyLUKS2(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED, 0)))
-		return r;
-
-	if ((flags & CRYPT_ACTIVATE_KEYRING_KEY) && !crypt_use_keyring_for_vk(cd))
-		return -EINVAL;
-
-	if ((flags & CRYPT_ACTIVATE_ALLOW_UNBOUND_KEY) && name)
-		return -EINVAL;
-
-	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
-	if (r < 0)
-		return r;
-
-	return LUKS2_token_open_and_activate(cd, &cd->u.luks2.hdr, token, name, type,
-					     pin, pin_size, flags, usrptr);
+	return r;
 }
 
 int crypt_activate_by_token(struct crypt_device *cd,
@@ -7181,7 +7167,7 @@ int crypt_volume_key_keyring(struct crypt_device *cd __attribute__((unused)), in
 int crypt_volume_key_load_in_keyring(struct crypt_device *cd, struct volume_key *vk)
 {
 	int r;
-	const char *type_name = key_type_name(LOGON_KEY);
+	const char *type_name = key_type_name(cd->keyring_key_type);
 
 	if (!vk || !cd || !type_name)
 		return -EINVAL;
@@ -7193,12 +7179,21 @@ int crypt_volume_key_load_in_keyring(struct crypt_device *cd, struct volume_key 
 
 	log_dbg(cd, "Loading key (%zu bytes, type %s) in thread keyring.", vk->keylength, type_name);
 
-	r = keyring_add_key_in_thread_keyring(LOGON_KEY, vk->key_description, vk->key, vk->keylength);
+	r = keyring_add_key_in_thread_keyring(cd->keyring_key_type, vk->key_description, vk->key, vk->keylength);
 	if (r) {
 		log_dbg(cd, "keyring_add_key_in_thread_keyring failed (error %d)", r);
 		log_err(cd, _("Failed to load key in kernel keyring."));
 	} else
 		crypt_set_key_in_keyring(cd, 1);
+
+	if (!r && cd->link_vk_to_keyring) {
+		log_dbg(cd, "Linking volume key to the specified keyring");
+		r = keyring_link_key_to_keyring(cd->keyring_key_type, vk->key_description, cd->keyring_to_link_vk);
+		if (r) {
+			log_err(cd, _("Failed to link key to the specified keyring."));
+			log_dbg(cd, "The keyring_link_key_to_keyring function failed (error %d).", r);
+		}
+	}
 
 	return r;
 }
@@ -7235,6 +7230,45 @@ void crypt_drop_keyring_key_by_description(struct crypt_device *cd, const char *
 	crypt_set_key_in_keyring(cd, 0);
 }
 
+int crypt_set_keyring_to_link(struct crypt_device *cd, const char *keyring_to_link_vk)
+{
+	int32_t id = 0;
+
+	if (!cd)
+		return -EINVAL;
+
+	if (keyring_to_link_vk) {
+		id = keyring_by_name(keyring_to_link_vk);
+		if (id == 0) {
+			log_err(cd, _("Invalid keyring format \"%s\"."), keyring_to_link_vk);
+			return -EINVAL;
+		}
+	}
+
+	cd->keyring_to_link_vk = id;
+	cd->link_vk_to_keyring = id != 0;
+
+	return 0;
+}
+
+int crypt_set_vk_keyring_type(struct crypt_device *cd, const char *key_type_desc)
+{
+	if (!cd)
+		return -EINVAL;
+
+	key_type_t key_type = key_type_desc ? key_type_by_name(key_type_desc) : LOGON_KEY;
+	if (key_type != LOGON_KEY && key_type != USER_KEY)
+		return -EINVAL;
+
+	cd->keyring_key_type = key_type;
+	return 0;
+}
+
+const char *crypt_get_vk_keyring_type(struct crypt_device *cd)
+{
+	return key_type_name(cd ? cd->keyring_key_type : LOGON_KEY);
+}
+
 /* internal only */
 void crypt_drop_keyring_key(struct crypt_device *cd, struct volume_key *vks)
 {
@@ -7252,34 +7286,15 @@ int crypt_activate_by_keyring(struct crypt_device *cd,
 			      int keyslot,
 			      uint32_t flags)
 {
-	char *passphrase;
-	size_t passphrase_size;
 	int r;
+	struct crypt_keyslot_context kc;
 
 	if (!cd || !key_description)
 		return -EINVAL;
 
-	log_dbg(cd, "%s volume %s [keyslot %d] using passphrase in keyring.",
-		name ? "Activating" : "Checking", name ?: "passphrase", keyslot);
-
-	if (!kernel_keyring_support()) {
-		log_err(cd, _("Kernel keyring is not supported by the kernel."));
-		return -EINVAL;
-	}
-
-	r = _activate_check_status(cd, name, flags & CRYPT_ACTIVATE_REFRESH);
-	if (r < 0)
-		return r;
-
-	r = keyring_get_passphrase(key_description, &passphrase, &passphrase_size);
-	if (r < 0) {
-		log_err(cd, _("Failed to read passphrase from keyring (error %d)."), r);
-		return -EINVAL;
-	}
-
-	r = _activate_by_passphrase(cd, name, keyslot, passphrase, passphrase_size, flags);
-
-	crypt_safe_free(passphrase);
+	crypt_keyslot_unlock_by_keyring_internal(&kc, key_description);
+	r = crypt_activate_by_keyslot_context(cd, name, keyslot, &kc, flags);
+	crypt_keyslot_context_destroy_internal(&kc);
 
 	return r;
 }

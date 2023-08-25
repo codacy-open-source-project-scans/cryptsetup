@@ -40,6 +40,17 @@ typedef int (*keyslot_context_get_volume_key) (
 	int keyslot,
 	struct volume_key **r_vk);
 
+typedef int (*keyslot_context_get_generic_volume_key) (
+	struct crypt_device *cd,
+	struct crypt_keyslot_context *kc,
+	struct volume_key **r_vk);
+
+typedef int (*keyslot_context_get_generic_signed_key) (
+	struct crypt_device *cd,
+	struct crypt_keyslot_context *kc,
+	struct volume_key **r_vk,
+	struct volume_key **r_signature);
+
 typedef int (*keyslot_context_get_passphrase) (
 	struct crypt_device *cd,
 	struct crypt_keyslot_context *kc,
@@ -71,17 +82,36 @@ struct crypt_keyslot_context {
 		const char *volume_key;
 		size_t volume_key_size;
 	} k;
+	struct {
+		const char *volume_key;
+		size_t volume_key_size;
+		const char *signature;
+		size_t signature_size;
+	} ks;
+	struct {
+		const char *key_description;
+	} kr;
+	struct {
+		const char *key_description;
+	} vk_kr;
 	} u;
 
 	int error;
 
 	char *i_passphrase;
 	size_t i_passphrase_size;
+	char *i_volume_key;
+	size_t i_volume_key_size;
 
-	keyslot_context_get_key		get_luks2_key;
-	keyslot_context_get_volume_key	get_luks1_volume_key;
-	keyslot_context_get_volume_key	get_luks2_volume_key;
-	keyslot_context_get_passphrase	get_passphrase;
+	keyslot_context_get_key			get_luks2_key;
+	keyslot_context_get_volume_key		get_luks1_volume_key;
+	keyslot_context_get_volume_key		get_luks2_volume_key;
+	keyslot_context_get_generic_volume_key	get_plain_volume_key;
+	keyslot_context_get_generic_volume_key	get_bitlk_volume_key;
+	keyslot_context_get_generic_volume_key	get_fvault2_volume_key;
+	keyslot_context_get_generic_signed_key	get_verity_volume_key;
+	keyslot_context_get_generic_volume_key	get_integrity_volume_key;
+	keyslot_context_get_passphrase		get_passphrase;
 };
 
 void crypt_keyslot_context_destroy_internal(struct crypt_keyslot_context *method);
@@ -89,6 +119,12 @@ void crypt_keyslot_context_destroy_internal(struct crypt_keyslot_context *method
 void crypt_keyslot_unlock_by_key_init_internal(struct crypt_keyslot_context *kc,
 	const char *volume_key,
 	size_t volume_key_size);
+
+void crypt_keyslot_unlock_by_signed_key_init_internal(struct crypt_keyslot_context *kc,
+	const char *volume_key,
+	size_t volume_key_size,
+	const char *signature,
+	size_t signature_size);
 
 void crypt_keyslot_unlock_by_passphrase_init_internal(struct crypt_keyslot_context *kc,
 	const char *passphrase,
@@ -105,6 +141,12 @@ void crypt_keyslot_unlock_by_token_init_internal(struct crypt_keyslot_context *k
 	const char *pin,
 	size_t pin_size,
 	void *usrptr);
+
+void crypt_keyslot_unlock_by_keyring_internal(struct crypt_keyslot_context *kc,
+	const char *key_description);
+
+void crypt_keyslot_unlock_by_vk_in_keyring_internal(struct crypt_keyslot_context *kc,
+	const char *key_description);
 
 const char *keyslot_context_type_string(const struct crypt_keyslot_context *kc);
 
