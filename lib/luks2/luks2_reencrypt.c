@@ -162,6 +162,7 @@ static uint64_t reencrypt_get_data_offset_old(struct luks2_hdr *hdr)
 	return reencrypt_data_offset(hdr, 0);
 }
 #endif
+
 static int reencrypt_digest(struct luks2_hdr *hdr, unsigned new)
 {
 	int segment = LUKS2_get_segment_id_by_flag(hdr, new ? "backup-final" : "backup-previous");
@@ -764,6 +765,7 @@ static int reencrypt_make_post_segments(struct crypt_device *cd,
 	return rh->jobj_segs_post ? 0 : -EINVAL;
 }
 #endif
+
 static uint64_t reencrypt_data_shift(struct luks2_hdr *hdr)
 {
 	json_object *jobj_keyslot, *jobj_area, *jobj_data_shift;
@@ -878,13 +880,13 @@ void LUKS2_reencrypt_free(struct crypt_device *cd, struct luks2_reencrypt *rh)
 	free(rh);
 }
 
-int LUKS2_reencrypt_max_hotzone_size(struct crypt_device *cd,
+#if USE_LUKS2_REENCRYPTION
+int LUKS2_reencrypt_max_hotzone_size(struct crypt_device *cd __attribute__((unused)),
 	struct luks2_hdr *hdr,
 	const struct reenc_protection *rp,
 	int reencrypt_keyslot,
 	uint64_t *r_length)
 {
-#if USE_LUKS2_REENCRYPTION
 	int r;
 	uint64_t dummy, area_length;
 
@@ -917,11 +919,8 @@ int LUKS2_reencrypt_max_hotzone_size(struct crypt_device *cd,
 	}
 
 	return -EINVAL;
-#else
-	return -ENOTSUP;
-#endif
 }
-#if USE_LUKS2_REENCRYPTION
+
 static size_t reencrypt_get_alignment(struct crypt_device *cd,
 		struct luks2_hdr *hdr)
 {
@@ -1002,7 +1001,6 @@ static int reencrypt_offset_backward_moved(struct luks2_hdr *hdr, json_object *j
 }
 
 static int reencrypt_offset_forward_moved(struct luks2_hdr *hdr,
-	json_object *jobj_segments,
 	uint64_t data_shift,
 	uint64_t *offset)
 {
@@ -1080,7 +1078,7 @@ static int reencrypt_offset(struct luks2_hdr *hdr,
 	if (di == CRYPT_REENCRYPT_FORWARD) {
 		if (reencrypt_mode(hdr) == CRYPT_REENCRYPT_DECRYPT &&
 		    LUKS2_get_segment_id_by_flag(hdr, "backup-moved-segment") >= 0) {
-			r = reencrypt_offset_forward_moved(hdr, jobj_segments, data_shift, offset);
+			r = reencrypt_offset_forward_moved(hdr, data_shift, offset);
 			if (!r && *offset > device_size)
 				*offset = device_size;
 			return r;
@@ -2639,7 +2637,6 @@ static int reencrypt_verify_keys(struct crypt_device *cd,
 }
 
 static int reencrypt_upload_single_key(struct crypt_device *cd,
-	struct luks2_hdr *hdr,
 	int digest,
 	struct volume_key *vks)
 {
@@ -2664,11 +2661,11 @@ static int reencrypt_upload_keys(struct crypt_device *cd,
 		return 0;
 
 	if (digest_new >= 0 && !crypt_is_cipher_null(reencrypt_segment_cipher_new(hdr)) &&
-	    (r = reencrypt_upload_single_key(cd, hdr, digest_new, vks)))
+	    (r = reencrypt_upload_single_key(cd, digest_new, vks)))
 		return r;
 
 	if (digest_old >= 0 && !crypt_is_cipher_null(reencrypt_segment_cipher_old(hdr)) &&
-	    (r = reencrypt_upload_single_key(cd, hdr, digest_old, vks))) {
+	    (r = reencrypt_upload_single_key(cd, digest_old, vks))) {
 		crypt_drop_keyring_key(cd, vks);
 		return r;
 	}
@@ -3305,7 +3302,17 @@ static int reencrypt_load(struct crypt_device *cd, struct luks2_hdr *hdr,
 
 	return 0;
 }
+#else
+int LUKS2_reencrypt_max_hotzone_size(struct crypt_device *cd __attribute__((unused)),
+	struct luks2_hdr *hdr __attribute__((unused)),
+	const struct reenc_protection *rp __attribute__((unused)),
+	int reencrypt_keyslot __attribute__((unused)),
+	uint64_t *r_length __attribute__((unused)))
+{
+	return -ENOTSUP;
+}
 #endif
+
 static int reencrypt_lock_internal(struct crypt_device *cd, const char *uuid, struct crypt_lock_handle **reencrypt_lock)
 {
 	int r;
@@ -3754,7 +3761,7 @@ out:
 	return r;
 
 }
-#endif
+
 static int reencrypt_init_by_passphrase(struct crypt_device *cd,
 	const char *name,
 	const char *passphrase,
@@ -3765,7 +3772,6 @@ static int reencrypt_init_by_passphrase(struct crypt_device *cd,
 	const char *cipher_mode,
 	const struct crypt_params_reencrypt *params)
 {
-#if USE_LUKS2_REENCRYPTION
 	int r;
 	crypt_reencrypt_info ri;
 	struct volume_key *vks = NULL;
@@ -3827,11 +3833,22 @@ out:
 		crypt_drop_keyring_key(cd, vks);
 	crypt_free_volume_key(vks);
 	return r < 0 ? r : LUKS2_find_keyslot(hdr, "reencrypt");
+}
 #else
+static int reencrypt_init_by_passphrase(struct crypt_device *cd,
+	const char *name __attribute__((unused)),
+	const char *passphrase __attribute__((unused)),
+	size_t passphrase_size __attribute__((unused)),
+	int keyslot_old __attribute__((unused)),
+	int keyslot_new __attribute__((unused)),
+	const char *cipher __attribute__((unused)),
+	const char *cipher_mode __attribute__((unused)),
+	const struct crypt_params_reencrypt *params __attribute__((unused)))
+{
 	log_err(cd, _("This operation is not supported for this device type."));
 	return -ENOTSUP;
-#endif
 }
+#endif
 
 int crypt_reencrypt_init_by_keyring(struct crypt_device *cd,
 	const char *name,
@@ -4171,14 +4188,12 @@ static int reencrypt_teardown(struct crypt_device *cd, struct luks2_hdr *hdr,
 
 	return r;
 }
-#endif
 
 int crypt_reencrypt_run(
 	struct crypt_device *cd,
 	int (*progress)(uint64_t size, uint64_t offset, void *usrptr),
 	void *usrptr)
 {
-#if USE_LUKS2_REENCRYPTION
 	int r;
 	crypt_reencrypt_info ri;
 	struct luks2_hdr *hdr;
@@ -4239,19 +4254,9 @@ int crypt_reencrypt_run(
 
 	r = reencrypt_teardown(cd, hdr, rh, rs, quit, progress, usrptr);
 	return r;
-#else
-	log_err(cd, _("This operation is not supported for this device type."));
-	return -ENOTSUP;
-#endif
 }
 
-int crypt_reencrypt(
-	struct crypt_device *cd,
-	int (*progress)(uint64_t size, uint64_t offset, void *usrptr))
-{
-	return crypt_reencrypt_run(cd, progress, NULL);
-}
-#if USE_LUKS2_REENCRYPTION
+
 static int reencrypt_recovery(struct crypt_device *cd,
 		struct luks2_hdr *hdr,
 		uint64_t device_size,
@@ -4287,7 +4292,27 @@ out:
 
 	return r;
 }
+#else /* USE_LUKS2_REENCRYPTION */
+int crypt_reencrypt_run(
+	struct crypt_device *cd,
+	int (*progress)(uint64_t size, uint64_t offset, void *usrptr),
+	void *usrptr)
+{
+	UNUSED(progress);
+	UNUSED(usrptr);
+
+	log_err(cd, _("This operation is not supported for this device type."));
+	return -ENOTSUP;
+}
 #endif
+
+int crypt_reencrypt(
+	struct crypt_device *cd,
+	int (*progress)(uint64_t size, uint64_t offset, void *usrptr))
+{
+	return crypt_reencrypt_run(cd, progress, NULL);
+}
+
 /*
  * use only for calculation of minimal data device size.
  * The real data offset is taken directly from segments!

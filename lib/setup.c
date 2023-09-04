@@ -2551,6 +2551,10 @@ int crypt_format_luks2_opal(struct crypt_device *cd,
 			log_err(cd, _("Cannot format device %s, permission denied."),
 				mdata_device_path(cd));
 			r = -EINVAL;
+		} else if (r == -EIO) {
+			log_err(cd, _("Cannot format device %s, OPAL device seems to be fully write-protected now."),
+				mdata_device_path(cd));
+			log_err(cd, _("This is perhaps a bug in firmware. Run OPAL PSID reset and reconnect for recovery."));
 		} else
 			log_err(cd, _("Cannot format device %s."),
 				mdata_device_path(cd));
@@ -4720,7 +4724,7 @@ out:
 }
 
 #if USE_LUKS2_REENCRYPTION
-static int load_all_keys(struct crypt_device *cd, struct luks2_hdr *hdr, struct volume_key *vks)
+static int load_all_keys(struct crypt_device *cd, struct volume_key *vks)
 {
 	int r;
 	struct volume_key *vk = vks;
@@ -4771,7 +4775,7 @@ static int _open_all_keys(struct crypt_device *cd,
 		keyslot = r;
 
 	if (r >= 0 && (flags & CRYPT_ACTIVATE_KEYRING_KEY))
-		r = load_all_keys(cd, hdr, _vks);
+		r = load_all_keys(cd, _vks);
 
 	if (r >= 0 && vks)
 		MOVE_REF(*vks, _vks);
@@ -5768,6 +5772,9 @@ int crypt_get_rng_type(struct crypt_device *cd)
 
 int crypt_memory_lock(struct crypt_device *cd, int lock)
 {
+	UNUSED(cd);
+	UNUSED(lock);
+
 	return 0;
 }
 
