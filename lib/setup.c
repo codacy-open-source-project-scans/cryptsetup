@@ -62,6 +62,7 @@ struct crypt_device {
 
 	bool link_vk_to_keyring;
 	int32_t keyring_to_link_vk;
+	const char *user_key_name;
 	key_type_t keyring_key_type;
 
 	uint64_t data_offset;
@@ -3219,7 +3220,7 @@ int crypt_compare_dm_devices(struct crypt_device *cd,
 }
 
 static int _reload_device(struct crypt_device *cd, const char *name,
-			  struct crypt_dm_active_device *sdmd)
+			  struct crypt_dm_active_device *sdmd, uint32_t dmflags)
 {
 	int r;
 	struct crypt_dm_active_device tdmd;
@@ -3287,7 +3288,7 @@ static int _reload_device(struct crypt_device *cd, const char *name,
 	tdmd.flags = sdmd->flags;
 	tgt->size = tdmd.size = sdmd->size;
 
-	r = dm_reload_device(cd, name, &tdmd, 0, 1);
+	r = dm_reload_device(cd, name, &tdmd, dmflags, 1);
 out:
 	dm_targets_free(cd, &tdmd);
 	free(CONST_CAST(void*)tdmd.uuid);
@@ -3470,7 +3471,7 @@ int crypt_resize(struct crypt_device *cd, const char *name, uint64_t new_size)
 	struct crypt_dm_active_device dmdq, dmd = {};
 	struct dm_target *tgt = &dmdq.segment;
 	struct crypt_params_integrity params = {};
-	uint32_t supported_flags = 0;
+	uint32_t supported_flags = 0, dmflags = 0;
 	uint64_t old_size;
 	int r;
 
@@ -3488,7 +3489,10 @@ int crypt_resize(struct crypt_device *cd, const char *name, uint64_t new_size)
 		return -EINVAL;
 	}
 
-	log_dbg(cd, "Resizing device %s to %" PRIu64 " sectors.", name, new_size);
+	if (new_size)
+		log_dbg(cd, "Resizing device %s to %" PRIu64 " sectors.", name, new_size);
+	else
+		log_dbg(cd, "Resizing device %s to underlying device size.", name);
 
 	r = dm_query_device(cd, name, DM_ACTIVE_CRYPT_KEYSIZE | DM_ACTIVE_CRYPT_KEY |
 			    DM_ACTIVE_INTEGRITY_PARAMS | DM_ACTIVE_JOURNAL_CRYPT_KEY |
@@ -3556,7 +3560,8 @@ int crypt_resize(struct crypt_device *cd, const char *name, uint64_t new_size)
 				tgt->u.integrity.journal_integrity_key, &params);
 		if (r)
 			goto out;
-		r = _reload_device(cd, name, &dmd);
+		/* Backend device cannot be smaller here, device_block_adjust() will fail if so. */
+		r = _reload_device(cd, name, &dmd, DM_SUSPEND_SKIP_LOCKFS | DM_SUSPEND_NOFLUSH);
 		if (r)
 			goto out;
 
@@ -3624,8 +3629,13 @@ int crypt_resize(struct crypt_device *cd, const char *name, uint64_t new_size)
 			r = -ENOTSUP;
 		else if (isLUKS2(cd->type))
 			r = LUKS2_unmet_requirements(cd, &cd->u.luks2.hdr, 0, 0);
-		if (!r)
-			r = _reload_device(cd, name, &dmd);
+
+		if (!r) {
+			/* Skip flush and lockfs if extending device */
+			if (new_size > dmdq.size)
+				dmflags = DM_SUSPEND_SKIP_LOCKFS | DM_SUSPEND_NOFLUSH;
+			r = _reload_device(cd, name, &dmd, dmflags);
+		}
 
 		if (r && tgt->type == DM_INTEGRITY &&
 		    !dm_flags(cd, tgt->type, &supported_flags) &&
@@ -3984,6 +3994,44 @@ static int resume_luks1_by_volume_key(struct crypt_device *cd,
 	return r;
 }
 
+static key_serial_t crypt_volume_key_load_in_user_keyring(struct crypt_device *cd, struct volume_key *vk)
+{
+	key_serial_t kid;
+	const char *type_name;
+
+	assert(cd);
+	assert(cd->link_vk_to_keyring);
+
+	if (!vk || !(type_name = key_type_name(cd->keyring_key_type)))
+		return -EINVAL;
+
+	log_dbg(cd, "Linking volume key (type %s, name %s) to the specified keyring",
+		    type_name, cd->user_key_name);
+
+	kid = keyring_add_key_to_custom_keyring(cd->keyring_key_type, cd->user_key_name, vk->key, vk->keylength, cd->keyring_to_link_vk);
+	if (kid <= 0) {
+		log_err(cd, _("Failed to link key to the specified keyring."));
+		log_dbg(cd, "The keyring_link_key_to_keyring function failed (error %d).", errno);
+	}
+
+	return kid;
+}
+
+static void crypt_unlink_key_from_custom_keyring(struct crypt_device *cd, key_serial_t kid)
+{
+	assert(cd);
+	assert(cd->keyring_to_link_vk);
+
+	log_dbg(cd, "Unlinking volume key (id: %" PRIi32 ") from kernel keyring (id: %" PRIi32 ").",
+		kid, cd->keyring_to_link_vk);
+
+	if (!keyring_unlink_key_from_keyring(kid, cd->keyring_to_link_vk))
+		return;
+
+	log_dbg(cd, "keyring_unlink_key_from_keyring failed with errno %d.", errno);
+	log_err(cd, _("Failed to unlink volume key from user specified keyring."));
+}
+
 static int resume_luks2_by_volume_key(struct crypt_device *cd,
 		int digest,
 		struct volume_key *vk,
@@ -3992,6 +4040,7 @@ static int resume_luks2_by_volume_key(struct crypt_device *cd,
 	bool use_keyring;
 	int r, enc_type;
 	uint32_t opal_segment_number;
+	key_serial_t user_vk_kid = 0;
 	struct volume_key *p_crypt = vk, *p_opal = NULL, *zerokey = NULL, *crypt_key = NULL, *opal_key = NULL;
 
 	assert(digest >= 0);
@@ -4030,10 +4079,22 @@ static int resume_luks2_by_volume_key(struct crypt_device *cd,
 		use_keyring = false;
 	}
 
-	if (use_keyring && p_crypt) {
-		r = LUKS2_volume_key_load_in_keyring_by_digest(cd, p_crypt, digest);
-		if (r < 0)
-			goto out;
+	if (use_keyring) {
+		if (p_crypt) {
+			r = LUKS2_volume_key_load_in_keyring_by_digest(cd, p_crypt, digest);
+			if (r < 0)
+				goto out;
+		}
+
+		/* upload volume key in custom keyring if requested */
+		if (cd->link_vk_to_keyring) {
+			user_vk_kid = crypt_volume_key_load_in_user_keyring(cd, vk);
+			if (user_vk_kid <= 0) {
+				log_err(cd, _("Failed to link volume key in user defined keyring."));
+				r = -EINVAL;
+				goto out;
+			}
+		}
 	}
 
 	if (p_opal) {
@@ -4055,8 +4116,11 @@ static int resume_luks2_by_volume_key(struct crypt_device *cd,
 		log_err(cd, _("Error during resuming device %s."), name);
 
 out:
-	if (r < 0)
+	if (r < 0) {
 		crypt_drop_keyring_key(cd, p_crypt);
+		if (user_vk_kid > 0 && cd->link_vk_to_keyring)
+			crypt_unlink_key_from_custom_keyring(cd, user_vk_kid);
+	}
 
 	if (r < 0 && p_opal)
 		opal_lock(cd, crypt_data_device(cd), opal_segment_number);
@@ -4263,7 +4327,8 @@ int crypt_keyslot_change_by_passphrase(struct crypt_device *cd,
 	const char *new_passphrase,
 	size_t new_passphrase_size)
 {
-	int digest = -1, r, keyslot_new_orig = keyslot_new;
+	bool keyslot_swap = false;
+	int digest = -1, r;
 	struct luks2_keyslot_params params;
 	struct volume_key *vk = NULL;
 
@@ -4298,13 +4363,21 @@ int crypt_keyslot_change_by_passphrase(struct crypt_device *cd,
 	}
 	keyslot_old = r;
 
-	if (keyslot_new == CRYPT_ANY_SLOT) {
-		if (isLUKS1(cd->type))
-			keyslot_new = LUKS_keyslot_find_empty(&cd->u.luks1.hdr);
-		else if (isLUKS2(cd->type))
+	if (isLUKS2(cd->type)) {
+		/* If there is a free keyslot (both id and binary area) avoid in-place keyslot area overwrite  */
+		if (keyslot_new == CRYPT_ANY_SLOT || keyslot_new == keyslot_old) {
 			keyslot_new = LUKS2_keyslot_find_empty(cd, &cd->u.luks2.hdr, vk->keylength);
-		if (keyslot_new < 0)
-			keyslot_new = keyslot_old;
+			if (keyslot_new < 0)
+				keyslot_new = keyslot_old;
+			else
+				keyslot_swap = true;
+		}
+	} else if (isLUKS1(cd->type)) {
+		if (keyslot_new == CRYPT_ANY_SLOT) {
+			keyslot_new = LUKS_keyslot_find_empty(&cd->u.luks1.hdr);
+			if (keyslot_new < 0)
+				keyslot_new = keyslot_old;
+		}
 	}
 	log_dbg(cd, "Key change, old slot %d, new slot %d.", keyslot_old, keyslot_new);
 
@@ -4327,16 +4400,8 @@ int crypt_keyslot_change_by_passphrase(struct crypt_device *cd,
 			r = LUKS2_token_assignment_copy(cd, &cd->u.luks2.hdr, keyslot_old, keyslot_new, 0);
 			if (r < 0)
 				goto out;
-		} else {
+		} else
 			log_dbg(cd, "Key slot %d is going to be overwritten.", keyslot_old);
-			/* FIXME: improve return code so that we can detect area is damaged */
-			r = LUKS2_keyslot_wipe(cd, &cd->u.luks2.hdr, keyslot_old, 1);
-			if (r) {
-				/* (void)crypt_keyslot_destroy(cd, keyslot_old); */
-				r = -EINVAL;
-				goto out;
-			}
-		}
 
 		r = LUKS2_keyslot_store(cd,  &cd->u.luks2.hdr,
 					keyslot_new, new_passphrase,
@@ -4345,7 +4410,7 @@ int crypt_keyslot_change_by_passphrase(struct crypt_device *cd,
 			goto out;
 
 		/* Swap old & new so the final keyslot number remains */
-		if (keyslot_new_orig == CRYPT_ANY_SLOT && keyslot_old != keyslot_new) {
+		if (keyslot_swap && keyslot_old != keyslot_new) {
 			r = LUKS2_keyslot_swap(cd, &cd->u.luks2.hdr, keyslot_old, keyslot_new);
 			if (r < 0)
 				goto out;
@@ -4472,7 +4537,7 @@ int crypt_keyslot_destroy(struct crypt_device *cd, int keyslot)
 		return LUKS_del_key(keyslot, &cd->u.luks1.hdr, cd);
 	}
 
-	return LUKS2_keyslot_wipe(cd, &cd->u.luks2.hdr, keyslot, 0);
+	return LUKS2_keyslot_wipe(cd, &cd->u.luks2.hdr, keyslot);
 }
 
 static int _check_header_data_overlap(struct crypt_device *cd, const char *name)
@@ -4589,6 +4654,7 @@ int create_or_reload_device(struct crypt_device *cd, const char *name,
 	enum devcheck device_check;
 	struct dm_target *tgt;
 	uint64_t offset;
+	uint32_t dmflags = 0;
 
 	if (!type || !name || !single_segment(dmd))
 		return -EINVAL;
@@ -4602,9 +4668,12 @@ int create_or_reload_device(struct crypt_device *cd, const char *name,
 	if (r)
 		return r;
 
-	if (dmd->flags & CRYPT_ACTIVATE_REFRESH)
-		r = _reload_device(cd, name, dmd);
-	else {
+	if (dmd->flags & CRYPT_ACTIVATE_REFRESH) {
+		/* Refresh and recalculate means increasing dm-integrity device */
+		if (tgt->type == DM_INTEGRITY && dmd->flags & CRYPT_ACTIVATE_RECALCULATE)
+			dmflags = DM_SUSPEND_SKIP_LOCKFS | DM_SUSPEND_NOFLUSH;;
+		r = _reload_device(cd, name, dmd, dmflags);
+	} else {
 		if (tgt->type == DM_CRYPT || tgt->type == DM_LINEAR) {
 			device_check = dmd->flags & CRYPT_ACTIVATE_SHARED ? DEV_OK : DEV_EXCL;
 			offset = tgt->type == DM_CRYPT ? tgt->u.crypt.offset : tgt->u.linear.offset;
@@ -4673,6 +4742,7 @@ static int _open_and_activate(struct crypt_device *cd,
 {
 	bool use_keyring;
 	int r;
+	key_serial_t user_vk_kid = 0;
 	struct volume_key *p_crypt = NULL, *p_opal = NULL, *crypt_key = NULL, *opal_key = NULL, *vk = NULL;
 
 	r = LUKS2_keyslot_open(cd, keyslot,
@@ -4683,39 +4753,57 @@ static int _open_and_activate(struct crypt_device *cd,
 		return r;
 	keyslot = r;
 
-	if (LUKS2_segment_is_hw_opal(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT)) {
+	/* split the key only if we do activation */
+	if (name && LUKS2_segment_is_hw_opal(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT)) {
 		r = LUKS2_split_crypt_and_opal_keys(cd, &cd->u.luks2.hdr,
 						    vk, &crypt_key,
 						    &opal_key);
 		if (r < 0)
 			goto out;
 
+		/* copy volume key digest id in crypt subkey */
+		crypt_volume_key_set_id(crypt_key, crypt_volume_key_get_id(vk));
+
 		p_crypt = crypt_key;
 		p_opal = opal_key ?: vk;
-	} else {
+	} else
 		p_crypt = vk;
-		p_opal = NULL;
-	}
 
-	if (!crypt_use_keyring_for_vk(cd) || !p_crypt)
+	if (!crypt_use_keyring_for_vk(cd))
 		use_keyring = false;
 	else
 		use_keyring = ((name && !crypt_is_cipher_null(crypt_get_cipher(cd))) ||
 			       (flags & CRYPT_ACTIVATE_KEYRING_KEY));
 
 	if (use_keyring) {
-		r = LUKS2_volume_key_load_in_keyring_by_keyslot(cd,
-				&cd->u.luks2.hdr, p_crypt, keyslot);
-		if (r < 0)
-			goto out;
-		flags |= CRYPT_ACTIVATE_KEYRING_KEY;
+		/* upload dm-crypt part of volume key in thread keyring if requested */
+		if (p_crypt) {
+			r = LUKS2_volume_key_load_in_keyring_by_digest(cd, p_crypt,
+								       crypt_volume_key_get_id(p_crypt));
+			if (r < 0)
+				goto out;
+			flags |= CRYPT_ACTIVATE_KEYRING_KEY;
+		}
+
+		/* upload the volume key in custom user keyring if requested */
+		if (cd->link_vk_to_keyring) {
+			user_vk_kid = crypt_volume_key_load_in_user_keyring(cd, vk);
+			if (user_vk_kid <= 0) {
+				log_err(cd, _("Failed to link volume key in user defined keyring."));
+				r = -EINVAL;
+				goto out;
+			}
+		}
 	}
 
 	if (name)
 		r = LUKS2_activate(cd, name, p_crypt, p_opal, flags);
 out:
-	if (r < 0)
+	if (r < 0) {
 		crypt_drop_keyring_key(cd, p_crypt);
+		if (user_vk_kid > 0 && cd->link_vk_to_keyring)
+			crypt_unlink_key_from_custom_keyring(cd, user_vk_kid);
+	}
 	crypt_free_volume_key(vk);
 	crypt_free_volume_key(crypt_key);
 	crypt_free_volume_key(opal_key);
@@ -5172,6 +5260,7 @@ int crypt_activate_by_keyslot_context(struct crypt_device *cd,
 	size_t passphrase_size;
 	const char *passphrase = NULL;
 	int unlocked_keyslot, r = -EINVAL;
+	key_serial_t user_vk_kid = 0;
 
 	log_dbg(cd, "%s volume %s [keyslot %d] using %s.",
 		name ? "Activating" : "Checking", name ?: "passphrase", keyslot, keyslot_context_type_string(kc));
@@ -5273,7 +5362,8 @@ int crypt_activate_by_keyslot_context(struct crypt_device *cd,
 		goto out;
 
 	if (isLUKS2(cd->type)) {
-		if (LUKS2_segment_is_hw_opal(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT)) {
+		/* split the key only if we do activation */
+		if (name && LUKS2_segment_is_hw_opal(&cd->u.luks2.hdr, CRYPT_DEFAULT_SEGMENT)) {
 			r = LUKS2_split_crypt_and_opal_keys(cd, &cd->u.luks2.hdr,
 							    vk, &crypt_key,
 							    &opal_key);
@@ -5290,20 +5380,30 @@ int crypt_activate_by_keyslot_context(struct crypt_device *cd,
 			p_ext_key = NULL;
 		}
 
-		if (!crypt_use_keyring_for_vk(cd) || !p_crypt)
+		if (!crypt_use_keyring_for_vk(cd))
 			use_keyring = false;
 		else
 			use_keyring = (name && !crypt_is_cipher_null(crypt_get_cipher(cd))) ||
 				      (flags & CRYPT_ACTIVATE_KEYRING_KEY);
 
 		if (use_keyring) {
-			r = LUKS2_key_description_by_segment(cd, &cd->u.luks2.hdr, p_crypt, CRYPT_DEFAULT_SEGMENT);
-			if (r < 0)
-				goto out;
-			r = crypt_volume_key_load_in_keyring(cd, p_crypt);
-			if (r < 0)
-				goto out;
-			flags |= CRYPT_ACTIVATE_KEYRING_KEY;
+			/* upload dm-crypt part of volume key in thread keyring if requested */
+			if (p_crypt) {
+				r = LUKS2_volume_key_load_in_keyring_by_digest(cd, p_crypt, crypt_volume_key_get_id(p_crypt));
+				if (r < 0)
+					goto out;
+				flags |= CRYPT_ACTIVATE_KEYRING_KEY;
+			}
+
+			/* upload the volume key in custom user keyring if requested */
+			if (cd->link_vk_to_keyring) {
+				user_vk_kid = crypt_volume_key_load_in_user_keyring(cd, vk);
+				if (user_vk_kid <= 0) {
+					log_err(cd, _("Failed to link volume key in user defined keyring."));
+					r = -EINVAL;
+					goto out;
+				}
+			}
 		}
 	} else {
 		p_crypt = vk;
@@ -5316,8 +5416,11 @@ int crypt_activate_by_keyslot_context(struct crypt_device *cd,
 	if (r >= 0 && unlocked_keyslot >= 0)
 		r = unlocked_keyslot;
 out:
-	if (r < 0)
+	if (r < 0) {
 		crypt_drop_keyring_key(cd, p_crypt);
+		if (user_vk_kid > 0 && cd->link_vk_to_keyring)
+			crypt_unlink_key_from_custom_keyring(cd, user_vk_kid);
+	}
 
 	crypt_free_volume_key(vk);
 	crypt_free_volume_key(crypt_key);
@@ -7173,10 +7276,9 @@ int crypt_volume_key_keyring(struct crypt_device *cd __attribute__((unused)), in
 /* internal only */
 int crypt_volume_key_load_in_keyring(struct crypt_device *cd, struct volume_key *vk)
 {
-	int r;
-	const char *type_name = key_type_name(cd->keyring_key_type);
+	key_serial_t kid;
 
-	if (!vk || !cd || !type_name)
+	if (!vk || !cd)
 		return -EINVAL;
 
 	if (!vk->key_description) {
@@ -7184,23 +7286,82 @@ int crypt_volume_key_load_in_keyring(struct crypt_device *cd, struct volume_key 
 		return -EINVAL;
 	}
 
-	log_dbg(cd, "Loading key (%zu bytes, type %s) in thread keyring.", vk->keylength, type_name);
+	log_dbg(cd, "Loading key (type logon, name %s) in thread keyring.", vk->key_description);
 
-	r = keyring_add_key_in_thread_keyring(cd->keyring_key_type, vk->key_description, vk->key, vk->keylength);
-	if (r) {
-		log_dbg(cd, "keyring_add_key_in_thread_keyring failed (error %d)", r);
+	kid = keyring_add_key_in_thread_keyring(LOGON_KEY, vk->key_description, vk->key, vk->keylength);
+	if (kid < 0) {
+		log_dbg(cd, "keyring_add_key_in_thread_keyring failed (error %d)", errno);
 		log_err(cd, _("Failed to load key in kernel keyring."));
 	} else
 		crypt_set_key_in_keyring(cd, 1);
 
-	if (!r && cd->link_vk_to_keyring) {
-		log_dbg(cd, "Linking volume key to the specified keyring");
-		r = keyring_link_key_to_keyring(cd->keyring_key_type, vk->key_description, cd->keyring_to_link_vk);
-		if (r) {
-			log_err(cd, _("Failed to link key to the specified keyring."));
-			log_dbg(cd, "The keyring_link_key_to_keyring function failed (error %d).", r);
-		}
+	return kid < 0 ? -EINVAL : 0;
+}
+
+/* internal only */
+int crypt_keyring_get_user_key(struct crypt_device *cd,
+		const char *key_description,
+		char **key,
+		size_t *key_size)
+{
+	int r;
+	key_serial_t kid;
+
+	if (!key_description || !key || !key_size)
+		return -EINVAL;
+
+	log_dbg(cd, "Requesting key %s (user type)", key_description);
+
+	kid = keyring_request_key_id(USER_KEY, key_description);
+	if (kid == -ENOTSUP) {
+		log_dbg(cd, "Kernel keyring features disabled.");
+		return -ENOTSUP;
+	} else if (kid < 0) {
+		log_dbg(cd, "keyring_request_key_id failed with errno %d.", errno);
+		return -EINVAL;
 	}
+
+	log_dbg(cd, "Reading content of kernel key (id %" PRIi32 ").", kid);
+
+	r = keyring_read_key(kid, key, key_size);
+	if (r < 0)
+		log_dbg(cd, "keyring_read_key failed with errno %d.", errno);
+
+	return r;
+}
+
+/* internal only */
+int crypt_keyring_get_key_by_name(struct crypt_device *cd,
+		const char *key_description,
+		char **key,
+		size_t *key_size)
+{
+	int r;
+	key_serial_t kid;
+
+	if (!key_description || !key || !key_size)
+		return -EINVAL;
+
+	log_dbg(cd, "Searching for key by name %s.", key_description);
+
+	kid = keyring_find_key_id_by_name(key_description);
+	if (kid == -ENOTSUP) {
+		log_dbg(cd, "Kernel keyring features disabled.");
+		return -ENOTSUP;
+	} else if (kid < 0) {
+		log_dbg(cd, "keyring_find_key_id_by_name failed with errno %d.", errno);
+		return -EINVAL;
+	}
+	else if (kid == 0) {
+		log_dbg(cd, "keyring_find_key_id_by_name failed with errno %d.", ENOENT);
+		return -ENOENT;
+	}
+
+	log_dbg(cd, "Reading content of kernel key (id %" PRIi32 ").", kid);
+
+	r = keyring_read_key(kid, key, key_size);
+	if (r < 0)
+		log_dbg(cd, "keyring_read_key failed with errno %d.", errno);
 
 	return r;
 }
@@ -7223,57 +7384,70 @@ void crypt_set_key_in_keyring(struct crypt_device *cd, unsigned key_in_keyring)
 /* internal only */
 void crypt_drop_keyring_key_by_description(struct crypt_device *cd, const char *key_description, key_type_t ktype)
 {
-	int r;
+	key_serial_t kid;
 	const char *type_name = key_type_name(ktype);
 
 	if (!key_description || !type_name)
 		return;
 
-	log_dbg(cd, "Requesting keyring %s key for revoke and unlink.", type_name);
+	log_dbg(cd, "Requesting kernel key %s (type %s) for unlink from thread keyring.", key_description, type_name);
 
-	r = keyring_revoke_and_unlink_key(ktype, key_description);
-	if (r)
-		log_dbg(cd, "keyring_revoke_and_unlink_key failed (error %d)", r);
 	crypt_set_key_in_keyring(cd, 0);
+
+	kid = keyring_request_key_id(ktype, key_description);
+	if (kid == -ENOTSUP) {
+		log_dbg(cd, "Kernel keyring features disabled.");
+		return;
+	} else if (kid < 0) {
+		log_dbg(cd, "keyring_request_key_id failed with errno %d.", errno);
+		return;
+	}
+
+	log_dbg(cd, "Unlinking volume key (id: %" PRIi32 ") from thread keyring.", kid);
+
+	if (!keyring_unlink_key_from_thread_keyring(kid))
+		return;
+
+	log_dbg(cd, "keyring_unlink_key_from_thread_keyring failed with errno %d.", errno);
+	log_err(cd, _("Failed to unlink volume key from thread keyring."));
+
 }
 
-int crypt_set_keyring_to_link(struct crypt_device *cd, const char *keyring_to_link_vk)
+int crypt_set_keyring_to_link(struct crypt_device *cd, const char *key_description,
+	const char *key_type_description, const char *keyring_to_link_vk)
 {
+	key_type_t key_type = USER_KEY;
+	const char *name = NULL;
 	int32_t id = 0;
 
-	if (!cd)
+	if (!cd || (!key_description && keyring_to_link_vk) ||
+	    (key_description && !keyring_to_link_vk))
+		return -EINVAL;
+
+	if (key_type_description)
+		key_type = key_type_by_name(key_type_description);
+
+	if (key_type != LOGON_KEY && key_type != USER_KEY)
 		return -EINVAL;
 
 	if (keyring_to_link_vk) {
-		id = keyring_by_name(keyring_to_link_vk);
+		id = keyring_find_keyring_id_by_name(keyring_to_link_vk);
 		if (id == 0) {
-			log_err(cd, _("Invalid keyring format \"%s\"."), keyring_to_link_vk);
+			log_err(cd, _("Could not find keyring described by \"%s\"."), keyring_to_link_vk);
 			return -EINVAL;
 		}
+		if (!(name = strdup(key_description)))
+			return -ENOMEM;
 	}
 
+	cd->keyring_key_type = key_type;
+
+	free(CONST_CAST(void*)cd->user_key_name);
+	cd->user_key_name = name;
 	cd->keyring_to_link_vk = id;
 	cd->link_vk_to_keyring = id != 0;
 
 	return 0;
-}
-
-int crypt_set_vk_keyring_type(struct crypt_device *cd, const char *key_type_desc)
-{
-	if (!cd)
-		return -EINVAL;
-
-	key_type_t key_type = key_type_desc ? key_type_by_name(key_type_desc) : LOGON_KEY;
-	if (key_type != LOGON_KEY && key_type != USER_KEY)
-		return -EINVAL;
-
-	cd->keyring_key_type = key_type;
-	return 0;
-}
-
-const char *crypt_get_vk_keyring_type(struct crypt_device *cd)
-{
-	return key_type_name(cd ? cd->keyring_key_type : LOGON_KEY);
 }
 
 /* internal only */

@@ -25,39 +25,36 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef HAVE_KEY_SERIAL_T
+#define HAVE_KEY_SERIAL_T
+typedef int32_t key_serial_t;
+#endif
+
 typedef enum { LOGON_KEY = 0, USER_KEY, BIG_KEY, TRUSTED_KEY, ENCRYPTED_KEY, INVALID_KEY } key_type_t;
 
 const char *key_type_name(key_type_t ktype);
 key_type_t key_type_by_name(const char *name);
-int32_t keyring_by_name(const char *name);
+key_serial_t keyring_find_key_id_by_name(const char *key_name);
+key_serial_t keyring_find_keyring_id_by_name(const char *keyring_name);
 
 int keyring_check(void);
 
-int keyring_get_key(const char *key_desc,
-		    char **key,
-		    size_t *key_size);
+key_serial_t keyring_request_key_id(key_type_t key_type,
+		const char *key_description);
 
-int keyring_read_by_id(const char *key_desc,
-		      char **passphrase,
-		      size_t *passphrase_len);
+int keyring_read_key(key_serial_t kid,
+		char **key,
+		size_t *key_size);
 
-int keyring_get_passphrase(const char *key_desc,
-		      char **passphrase,
-		      size_t *passphrase_len);
-
-int keyring_add_key_in_thread_keyring(
+key_serial_t keyring_add_key_in_thread_keyring(
 	key_type_t ktype,
 	const char *key_desc,
 	const void *key,
 	size_t key_size);
 
-int keyring_add_key_in_user_keyring(
-	key_type_t ktype,
-	const char *key_desc,
-	const void *key,
-	size_t key_size);
-
-int keyring_revoke_and_unlink_key(key_type_t ktype, const char *key_desc);
-int keyring_link_key_to_keyring(key_type_t ktype, const char *key_desc, int keyring_to_link);
+key_serial_t keyring_add_key_to_custom_keyring(key_type_t ktype, const char *key_desc, const void *key,
+				      size_t key_size, key_serial_t keyring_to_link);
+int keyring_unlink_key_from_keyring(key_serial_t kid, key_serial_t keyring_id);
+int keyring_unlink_key_from_thread_keyring(key_serial_t kid);
 
 #endif

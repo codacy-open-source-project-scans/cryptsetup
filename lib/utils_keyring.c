@@ -20,9 +20,11 @@
  */
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -31,11 +33,6 @@
 #include "libcryptsetup.h"
 #include "libcryptsetup_macros.h"
 #include "utils_keyring.h"
-
-#ifndef HAVE_KEY_SERIAL_T
-#define HAVE_KEY_SERIAL_T
-typedef int32_t key_serial_t;
-#endif
 
 #ifdef KERNEL_KEYRING
 
@@ -81,16 +78,6 @@ static long keyctl_describe(key_serial_t id, char *buffer, size_t buflen)
 static long keyctl_read(key_serial_t key, char *buffer, size_t buflen)
 {
 	return syscall(__NR_keyctl, KEYCTL_READ, key, buffer, buflen);
-}
-
-/* key handle permissions mask */
-typedef uint32_t key_perm_t;
-#define KEY_POS_ALL	0x3f000000
-#define KEY_USR_ALL	0x003f0000
-
-static long keyctl_setperm(key_serial_t id, key_perm_t perm)
-{
-	return syscall(__NR_keyctl, KEYCTL_SETPERM, id, perm);
 }
 
 /* keyctl_link */
@@ -213,174 +200,79 @@ int keyring_check(void)
 	return syscall(__NR_request_key, "logon", "dummy", NULL, 0) == -1l && errno != ENOSYS;
 }
 
-int keyring_add_key_in_thread_keyring(key_type_t ktype, const char *key_desc, const void *key, size_t key_size)
+static key_serial_t keyring_add_key_in_keyring(key_type_t ktype,
+		const char *key_desc,
+		const void *key,
+		size_t key_size,
+		key_serial_t keyring)
 {
-	key_serial_t kid;
 	const char *type_name = key_type_name(ktype);
 
 	if (!type_name || !key_desc)
 		return -EINVAL;
 
-	kid = add_key(type_name, key_desc, key, key_size, KEY_SPEC_THREAD_KEYRING);
-	if (kid < 0)
-		return -errno;
-
-	return 0;
+	return add_key(type_name, key_desc, key, key_size, keyring);
 }
 
-/* currently used in client utilities only */
-int keyring_add_key_in_user_keyring(key_type_t ktype, const char *key_desc, const void *key, size_t key_size)
+key_serial_t keyring_add_key_in_thread_keyring(key_type_t ktype, const char *key_desc, const void *key, size_t key_size)
 {
-	const char *type_name = key_type_name(ktype);
+	return keyring_add_key_in_keyring(ktype, key_desc, key, key_size, KEY_SPEC_THREAD_KEYRING);
+}
+
+key_serial_t keyring_request_key_id(key_type_t key_type,
+		const char *key_description)
+{
 	key_serial_t kid;
-
-	if (!type_name || !key_desc)
-		return -EINVAL;
-
-	kid = add_key(type_name, key_desc, key, key_size, KEY_SPEC_USER_KEYRING);
-	if (kid < 0)
-		return -errno;
-
-	return 0;
-}
-
-/* alias for the same code */
-int keyring_get_key(const char *key_desc,
-		    char **key,
-		    size_t *key_size)
-{
-	return keyring_get_passphrase(key_desc, key, key_size);
-}
-
-int keyring_read_by_id(const char *key_desc,
-		      char **passphrase,
-		      size_t *passphrase_len)
-{
-	int err;
-	key_serial_t kid;
-	long ret;
-	char *buf = NULL;
-	size_t len = 0;
-
-	do
-		kid = request_key(key_type_name(USER_KEY), key_desc, NULL, 0);
-	while (kid < 0 && errno == EINTR);
-
-	kid = keyring_by_name(key_desc);
-	if (kid < 0)
-		return kid;
-	else if (kid == 0)
-		return -ENOENT;
-
-	/* just get payload size */
-	ret = keyctl_read(kid, NULL, 0);
-	if (ret > 0) {
-		len = ret;
-		buf = crypt_safe_alloc(len);
-		if (!buf)
-			return -ENOMEM;
-
-		/* retrieve actual payload data */
-		ret = keyctl_read(kid, buf, len);
-	}
-
-	if (ret < 0) {
-		err = errno;
-		crypt_safe_free(buf);
-		return -err;
-	}
-
-	*passphrase = buf;
-	*passphrase_len = len;
-
-	return 0;
-}
-
-int keyring_get_passphrase(const char *key_desc,
-		      char **passphrase,
-		      size_t *passphrase_len)
-{
-	int err;
-	key_serial_t kid;
-	long ret;
-	char *buf = NULL;
-	size_t len = 0;
 
 	do {
-		kid = request_key(key_type_name(USER_KEY), key_desc, NULL, 0);
+		kid = request_key(key_type_name(key_type), key_description, NULL, 0);
 	} while (kid < 0 && errno == EINTR);
 
-	if (kid < 0)
-		return -errno;
-
-	/* just get payload size */
-	ret = keyctl_read(kid, NULL, 0);
-	if (ret > 0) {
-		len = ret;
-		buf = crypt_safe_alloc(len);
-		if (!buf)
-			return -ENOMEM;
-
-		/* retrieve actual payload data */
-		ret = keyctl_read(kid, buf, len);
-	}
-
-	if (ret < 0) {
-		err = errno;
-		crypt_safe_free(buf);
-		return -err;
-	}
-
-	*passphrase = buf;
-	*passphrase_len = len;
-
-	return 0;
+	return kid;
 }
 
-static int keyring_link_key_to_keyring_key_type(const char *type_name, const char *key_desc,
-						key_serial_t keyring_to_link)
+int keyring_read_key(key_serial_t kid,
+		char **key,
+		size_t *key_size)
 {
 	long r;
-	key_serial_t kid;
+	char *buf = NULL;
+	size_t len = 0;
 
-	if (!type_name || !key_desc)
+	assert(key);
+	assert(key_size);
+
+	/* just get payload size */
+	r = keyctl_read(kid, NULL, 0);
+	if (r > 0) {
+		len = r;
+		buf = crypt_safe_alloc(len);
+		if (!buf)
+			return -ENOMEM;
+
+		/* retrieve actual payload data */
+		r = keyctl_read(kid, buf, len);
+	}
+
+	if (r < 0) {
+		crypt_safe_free(buf);
 		return -EINVAL;
+	}
 
-	do {
-		kid = request_key(type_name, key_desc, NULL, 0);
-	} while (kid < 0 && errno == EINTR);
-
-	if (kid < 0)
-		return 0;
-
-	/* see https://mjg59.dreamwidth.org/37333.html */
-	if (keyring_to_link == KEY_SPEC_USER_KEYRING || keyring_to_link == KEY_SPEC_USER_SESSION_KEYRING)
-		keyctl_setperm(kid, KEY_POS_ALL | KEY_USR_ALL);
-	r = keyctl_link(kid, keyring_to_link);
-	if (r < 0)
-		return -errno;
+	*key = buf;
+	*key_size = len;
 
 	return 0;
 }
 
-static int keyring_revoke_and_unlink_key_type(const char *type_name, const char *key_desc)
+int keyring_unlink_key_from_keyring(key_serial_t kid, key_serial_t keyring_id)
 {
-	key_serial_t kid;
+	return keyctl_unlink(kid, keyring_id) < 0 ? -EINVAL : 0;
+}
 
-	if (!type_name || !key_desc)
-		return -EINVAL;
-
-	do {
-		kid = request_key(type_name, key_desc, NULL, 0);
-	} while (kid < 0 && errno == EINTR);
-
-	if (kid < 0)
-		return 0;
-
-	if (keyctl_unlink(kid, KEY_SPEC_THREAD_KEYRING))
-		return -errno;
-
-	return 0;
+int keyring_unlink_key_from_thread_keyring(key_serial_t kid)
+{
+	return keyctl_unlink(kid, KEY_SPEC_THREAD_KEYRING) < 0 ? -EINVAL : 0;
 }
 
 const char *key_type_name(key_type_t type)
@@ -394,26 +286,28 @@ const char *key_type_name(key_type_t type)
 	return NULL;
 }
 
-int32_t keyring_by_name(const char *name)
+key_serial_t keyring_find_key_id_by_name(const char *key_name)
 {
-	int32_t id = 0;
+	key_serial_t id = 0;
 	char *end;
 	char *name_copy, *name_copy_p;
 
-	if (name[0] == '@') {
-		if (strcmp(name, "@t" ) == 0) return KEY_SPEC_THREAD_KEYRING;
-		if (strcmp(name, "@p" ) == 0) return KEY_SPEC_PROCESS_KEYRING;
-		if (strcmp(name, "@s" ) == 0) return KEY_SPEC_SESSION_KEYRING;
-		if (strcmp(name, "@u" ) == 0) return KEY_SPEC_USER_KEYRING;
-		if (strcmp(name, "@us") == 0) return KEY_SPEC_USER_SESSION_KEYRING;
-		if (strcmp(name, "@g" ) == 0) return KEY_SPEC_GROUP_KEYRING;
-		if (strcmp(name, "@a" ) == 0) return KEY_SPEC_REQKEY_AUTH_KEY;
+	assert(key_name);
+
+	if (key_name[0] == '@') {
+		if (strcmp(key_name, "@t" ) == 0) return KEY_SPEC_THREAD_KEYRING;
+		if (strcmp(key_name, "@p" ) == 0) return KEY_SPEC_PROCESS_KEYRING;
+		if (strcmp(key_name, "@s" ) == 0) return KEY_SPEC_SESSION_KEYRING;
+		if (strcmp(key_name, "@u" ) == 0) return KEY_SPEC_USER_KEYRING;
+		if (strcmp(key_name, "@us") == 0) return KEY_SPEC_USER_SESSION_KEYRING;
+		if (strcmp(key_name, "@g" ) == 0) return KEY_SPEC_GROUP_KEYRING;
+		if (strcmp(key_name, "@a" ) == 0) return KEY_SPEC_REQKEY_AUTH_KEY;
 
 		return 0;
 	}
 
 	/* handle a lookup-by-name request "%<type>:<desc>", eg: "%keyring:_ses" */
-	name_copy = strdup(name);
+	name_copy = strdup(key_name);
 	if (!name_copy)
 		goto out;
 	name_copy_p = name_copy;
@@ -443,7 +337,7 @@ int32_t keyring_by_name(const char *name)
 		goto out;
 	}
 
-	id = strtoul(name, &end, 0);
+	id = strtoul(key_name, &end, 0);
 	if (*end)
 		id = 0;
 
@@ -452,6 +346,31 @@ out:
 		free(name_copy);
 
 	return id;
+}
+
+static bool numbered(const char *str)
+{
+	char *endp;
+
+	errno = 0;
+	(void) strtol(str, &endp, 0);
+	if (errno == ERANGE)
+		return false;
+
+	return *endp == '\0' ? true : false;
+}
+
+key_serial_t keyring_find_keyring_id_by_name(const char *keyring_name)
+{
+	assert(keyring_name);
+
+	/* "%:" is abbreviation for the type keyring */
+	if ((keyring_name[0] == '@' && keyring_name[1] != 'a') ||
+	    strstr(keyring_name, "%:") || strstr(keyring_name, "%keyring:") ||
+	    numbered(keyring_name))
+		return keyring_find_key_id_by_name(keyring_name);
+
+	return 0;
 }
 
 key_type_t key_type_by_name(const char *name)
@@ -465,14 +384,18 @@ key_type_t key_type_by_name(const char *name)
 	return INVALID_KEY;
 }
 
-int keyring_link_key_to_keyring(key_type_t ktype, const char *key_desc, key_serial_t keyring_to_link)
+key_serial_t keyring_add_key_to_custom_keyring(key_type_t ktype,
+				      const char *key_desc,
+				      const void *key,
+				      size_t key_size,
+				      key_serial_t keyring_to_link)
 {
-	return keyring_link_key_to_keyring_key_type(key_type_name(ktype), key_desc, keyring_to_link);
-}
+	const char *type_name = key_type_name(ktype);
 
-int keyring_revoke_and_unlink_key(key_type_t ktype, const char *key_desc)
-{
-	return keyring_revoke_and_unlink_key_type(key_type_name(ktype), key_desc);
+	if (!type_name || !key_desc)
+		return -EINVAL;
+
+	return add_key(type_name, key_desc, key, key_size, keyring_to_link);
 }
 
 #else /* KERNEL_KEYRING */
@@ -483,12 +406,20 @@ int keyring_check(void)
 	return 0;
 }
 
-int keyring_add_key_in_thread_keyring(key_type_t ktype, const char *key_desc, const void *key, size_t key_size)
+key_serial_t keyring_add_key_in_thread_keyring(key_type_t ktype, const char *key_desc, const void *key, size_t key_size)
 {
 	return -ENOTSUP;
 }
 
-int keyring_add_key_in_user_keyring(key_type_t ktype, const char *key_desc, const void *key, size_t key_size)
+key_serial_t keyring_request_key_id(key_type_t key_type,
+		const char *key_description)
+{
+	return -ENOTSUP;
+}
+
+int keyring_read_key(key_serial_t kid,
+		char **key,
+		size_t *key_size)
 {
 	return -ENOTSUP;
 }
@@ -498,22 +429,17 @@ int keyring_read_by_id(const char *key_desc, char **passphrase, size_t *passphra
 	return -ENOTSUP;
 }
 
-int keyring_get_passphrase(const char *key_desc, char **passphrase, size_t *passphrase_len)
-{
-	return -ENOTSUP;
-}
-
-int keyring_get_key(const char *key_desc, char **key, size_t *key_size)
-{
-	return -ENOTSUP;
-}
-
 const char *key_type_name(key_type_t type)
 {
 	return NULL;
 }
 
-int32_t keyring_by_name(const char *name)
+key_serial_t keyring_find_key_id_by_name(const char *key_name)
+{
+	return 0;
+}
+
+key_serial_t keyring_find_keyring_id_by_name(const char *keyring_name)
 {
 	return 0;
 }
@@ -523,12 +449,21 @@ key_type_t key_type_by_name(const char *name)
 	return INVALID_KEY;
 }
 
-int keyring_link_key_to_keyring(key_type_t ktype, const char *key_desc, key_serial_t keyring_to_link)
+key_serial_t keyring_add_key_to_custom_keyring(key_type_t ktype,
+				      const char *key_desc,
+				      const void *key,
+				      size_t key_size,
+				      key_serial_t keyring_to_link)
 {
 	return -ENOTSUP;
 }
 
-int keyring_revoke_and_unlink_key(key_type_t ktype, const char *key_desc)
+int keyring_unlink_key_from_keyring(key_serial_t kid, key_serial_t keyring_id)
+{
+	return -ENOTSUP;
+}
+
+int keyring_unlink_key_from_thread_keyring(key_serial_t kid)
 {
 	return -ENOTSUP;
 }

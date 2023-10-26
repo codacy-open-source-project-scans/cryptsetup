@@ -3,6 +3,7 @@
 PS4='$LINENO:'
 [ -z "$CRYPTSETUP_PATH" ] && CRYPTSETUP_PATH=".."
 CRYPTSETUP=$CRYPTSETUP_PATH/cryptsetup
+CRYPTSETUP_RAW=$CRYPTSETUP
 
 CRYPTSETUP_VALGRIND=../.libs/cryptsetup
 CRYPTSETUP_LIB_VALGRIND=../.libs
@@ -291,51 +292,85 @@ function add_scsi_device() {
 # $2 keyring to link VK to
 # $3 key type (optional)
 test_vk_link() {
-	KEY_TYPE=${3:-logon}
-	KEY_TYPE_ARG=""
-	if [ ! -z "$3" ]; then
-		KEY_TYPE_ARG="--volume-key-type $3"
+	KEY_TYPE=${3:-user}
+	if [ -z "$3" ]; then
+		KEY_DESC=$1
+	else
+		KEY_DESC="%$3:$1"
 	fi
 
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$2" $KEY_TYPE_ARG || fail
+	KEYCTL_KEY_NAME="%$KEY_TYPE:$1"
+
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$2"::"$KEY_DESC" || fail
 	keyctl search "$2" $KEY_TYPE $1 > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after activation."
 	$CRYPTSETUP close $DEV_NAME
 	keyctl search "$2" $KEY_TYPE $1 > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after deactivation."
-	keyctl unlink "%$KEY_TYPE:$1" "$2" || fail
+	keyctl unlink "$KEYCTL_KEY_NAME" "$2" || fail
 }
 
 # $1 key name
 # $2 keyring to link VK to
 # $3 key type (optional)
 test_vk_link_and_reactivate() {
-	KEY_TYPE=${3:-logon}
-	KEY_TYPE_ARG=""
-	if [ ! -z "$3" ]; then
-		KEY_TYPE_ARG="--volume-key-type $3"
+	KEY_TYPE=${3:-user}
+	if [ -z "$3" ]; then
+		KEY_DESC=$1
+	else
+		KEY_DESC="%$3:$1"
 	fi
 
-	LINKED_KEY_NAME="%$KEY_TYPE:$1"
+	KEYCTL_KEY_NAME="%$KEY_TYPE:$1"
 
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$2" $KEY_TYPE_ARG || fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$2"::"$KEY_DESC" || fail
 	keyctl search "$2" $KEY_TYPE $1 > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after activation."
 	$CRYPTSETUP close $DEV_NAME || fail
 	keyctl search "$2" $KEY_TYPE $1 > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after deactivation."
-	$CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-keyring $LINKED_KEY_NAME || fail "Failed to unlock volume via a VK in keyring."
+	$CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-keyring $KEY_DESC <&-|| fail "Failed to unlock volume via a VK in keyring."
 	$CRYPTSETUP luksSuspend $DEV_NAME || fail "Failed to suspend device."
-	$CRYPTSETUP luksResume $DEV_NAME --volume-key-keyring $LINKED_KEY_NAME || fail "Failed to resume via a VK in keyring."
+	$CRYPTSETUP luksResume $DEV_NAME --volume-key-keyring $KEY_DESC <&- || fail "Failed to resume via a VK in keyring."
 
 	echo $PWD1 | $CRYPTSETUP luksOpen $LOOPDEV --test-passphrase 2>/dev/null || fail
 	echo $PWD2 | $CRYPTSETUP luksOpen $LOOPDEV --test-passphrase 2>/dev/null && fail
-	echo $PWD2 | $CRYPTSETUP luksAddKey $FAST_PBKDF2 --volume-key-keyring $LINKED_KEY_NAME $LOOPDEV --new-key-slot 1 || fail "Failed to add passphrase by VK in keyring."
+	echo $PWD2 | $CRYPTSETUP luksAddKey $FAST_PBKDF_OPT --volume-key-keyring $KEY_DESC $LOOPDEV --new-key-slot 1 || fail "Failed to add passphrase by VK in keyring."
 	echo $PWD2 | $CRYPTSETUP luksOpen $LOOPDEV --test-passphrase 2>/dev/null || fail
 	$CRYPTSETUP luksKillSlot -q $LOOPDEV 1 2>/dev/null || fail
 
 	$CRYPTSETUP close $DEV_NAME || fail
 	# zero-out the key in keyring
-	keyctl pipe $LINKED_KEY_NAME | tr -c '\0' '\0' | keyctl pupdate $LINKED_KEY_NAME
-	$CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-keyring $LINKED_KEY_NAME > /dev/null 2>&1 && fail "Unlocked volume via a bad VK in keyring."
+	keyctl pipe $KEYCTL_KEY_NAME | tr -c '\0' '\0' | keyctl pupdate $KEYCTL_KEY_NAME
+	$CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-keyring $KEY_DESC <&- > /dev/null 2>&1 && fail "Unlocked volume via a bad VK in keyring."
 	keyctl search "$2" $KEY_TYPE $1 > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after bad activation."
-	keyctl unlink "%$KEY_TYPE:$1" "$2" || fail
+	keyctl unlink $KEYCTL_KEY_NAME "$2" || fail
+}
+
+function expect_run()
+{
+	export INFOSTRING="$(basename ${BASH_SOURCE[1]})-line-${BASH_LINENO[0]}"
+	expect "$@"
+}
+
+# expected unlocked keyslot id
+# command arguments
+function expect_unlocked_keyslot()
+{
+	command -v expect >/dev/null || {
+		echo "WARNING: expect tool missing, interactive test will be skipped."
+		return 0
+	}
+
+	EXPECT_TIMEOUT=60
+	EXPECT_KEY=$1
+
+	expect_run - >/dev/null <<EOF
+proc abort {} { send_error "Timeout. "; exit 2 }
+set timeout $EXPECT_TIMEOUT
+eval spawn $CRYPTSETUP_RAW $2
+expect timeout abort "Key slot $EXPECT_KEY unlocked."
+expect timeout abort "Command successful."
+expect timeout abort eof
+exit
+EOF
+	[ $? -eq 0 ] || return 1
 }
 
 export LANG=C
@@ -623,7 +658,7 @@ test $OLD_SIZE -eq $NEW_SIZE || fail
 $CRYPTSETUP close $DEV_NAME || fail
 
 prepare "[20] Disallow open/create if already mapped." wipe
-$CRYPTSETUP create $DEV_NAME $LOOPDEV -d $KEY1 || fail
+$CRYPTSETUP create $DEV_NAME $LOOPDEV -d $KEY1 --cipher aes-cbc-essiv:sha256 --key-size 256 || fail
 echo $PWD1 | $CRYPTSETUP -q luksFormat $FAST_PBKDF_OPT --type luks2 $LOOPDEV 2>/dev/null && fail
 $CRYPTSETUP remove  $DEV_NAME || fail
 echo $PWD1 | $CRYPTSETUP -q luksFormat $FAST_PBKDF_OPT --type luks2 $LOOPDEV || fail
@@ -680,6 +715,24 @@ $CRYPTSETUP luksDump $LOOPDEV | grep -q "2: luks2" && fail
 $CRYPTSETUP luksChangeKey $LOOPDEV $FAST_PBKDF_OPT -d $KEY1 $KEY2 || fail
 $CRYPTSETUP luksDump $LOOPDEV | grep -q "0: luks2" || fail
 $CRYPTSETUP luksChangeKey $LOOPDEV $FAST_PBKDF_OPT -d $KEY1 $KEY2 2>/dev/null && fail
+# make a free space in keyslot area
+echo $PWD1 | $CRYPTSETUP luksKillSlot -q $LOOPDEV 0 || fail
+
+# assert LUKS2 does not overwrite existing area with specific keyslot id
+AREA_OFFSET_OLD=$($CRYPTSETUP luksDump $LOOPDEV | grep -e "1: luks2" -A12 | grep -e "Area offset:" | cut -d: -f 2 | sed -e 's/[[:space:]]*\[bytes\]//g')
+[ 0$AREA_OFFSET_OLD -gt 0 ] || fail
+echo -e "$PWD1\n$PWD2\n" | $CRYPTSETUP luksChangeKey --key-slot 1 $LOOPDEV $FAST_PBKDF_OPT
+AREA_OFFSET_NEW=$($CRYPTSETUP luksDump $LOOPDEV | grep -e "1: luks2" -A12 | grep -e "Area offset:" | cut -d: -f 2 | sed -e 's/[[:space:]]*\[bytes\]//g')
+[ 0$AREA_OFFSET_NEW -gt 0 ] || fail
+[ $AREA_OFFSET_OLD -ne $AREA_OFFSET_NEW ] || fail "Area offsets remained same: old area $AREA_OFFSET_OLD, new area $AREA_OFFSET_NEW"
+
+# assert LUKS2 does not overwrite existing area with any sklot
+AREA_OFFSET_OLD=$($CRYPTSETUP luksDump $LOOPDEV | grep -e "1: luks2" -A12 | grep -e "Area offset:" | cut -d: -f 2 | sed -e 's/[[:space:]]*\[bytes\]//g')
+[ 0$AREA_OFFSET_OLD -gt 0 ] || fail
+echo -e "$PWD2\n$PWD1\n" | $CRYPTSETUP luksChangeKey $LOOPDEV $FAST_PBKDF_OPT
+AREA_OFFSET_NEW=$($CRYPTSETUP luksDump $LOOPDEV | grep -e "1: luks2" -A12 | grep -e "Area offset:" | cut -d: -f 2 | sed -e 's/[[:space:]]*\[bytes\]//g')
+[ 0$AREA_OFFSET_NEW -gt 0 ] || fail
+[ $AREA_OFFSET_OLD -ne $AREA_OFFSET_NEW ] || fail "Area offsets remained same: old area $AREA_OFFSET_OLD, new area $AREA_OFFSET_NEW"
 
 prepare "[24] Keyfile limit" wipe
 $CRYPTSETUP -q luksFormat $FAST_PBKDF_OPT --type luks2 $LOOPDEV $KEY1 --key-slot 0 -l 13 || fail
@@ -978,6 +1031,40 @@ if [ $HAVE_KEYRING -gt 0 -a -d /proc/sys/kernel/keys ]; then
 	$CRYPTSETUP token unassign --token-id 0 -S0 $LOOPDEV 2>/dev/null && fail
 	$CRYPTSETUP token unassign --token-id 0 -S44 $LOOPDEV 2>/dev/null && fail
 	$CRYPTSETUP token unassign --token-id 44 -S0 $LOOPDEV 2>/dev/null && fail
+
+	$CRYPTSETUP token remove $LOOPDEV --token-id 0 || fail
+	$CRYPTSETUP token add $LOOPDEV --key-description $TEST_TOKEN0 -S0 --token-id 0 || fail
+
+	# token 8 assigned to keyslot 0 and 5. Unlocks only 5
+	echo "$PWD2" | $CRYPTSETUP luksAddKey -q -S5 $FAST_PBKDF_OPT --token-id 0 $LOOPDEV || fail
+	echo -n "{\"type\":\"luks2-keyring\",\"keyslots\":[\"0\",\"5\"],\"key_description\":\"$TEST_TOKEN1\"}" | $CRYPTSETUP token import $LOOPDEV --token-id 8 || fail
+	load_key user $TEST_TOKEN1 "$PWD2" "$TEST_KEYRING" || fail "Cannot load 32 byte user key type"
+
+	# token 3 assigned to keyslot 1 (wrong passphrase)
+	echo "$PWD3" | $CRYPTSETUP luksAddKey -q -S1 $FAST_PBKDF_OPT --token-id 0 $LOOPDEV || fail
+	$CRYPTSETUP token add $LOOPDEV --key-description $TEST_TOKEN2 -S1 --token-id 3 || fail
+	load_key user $TEST_TOKEN2 "$PWDW" "$TEST_KEYRING" || fail "Cannot load 32 byte user key type"
+
+	# specific token, specific keyslot
+	$CRYPTSETUP open --test-passphrase --token-id 0 -S0 $LOOPDEV --token-only <&- || fail
+	# specific keyslot unlocked by any token
+	$CRYPTSETUP open --test-passphrase -S0 $LOOPDEV --token-only <&- || fail
+
+	# token 0 unusable for keyslot 5
+	$CRYPTSETUP open --test-passphrase --token-id 0 -S5 $LOOPDEV --token-only <&- >/dev/null && fail
+	# backup interactive prompt should work
+	echo $PWD2 | $CRYPTSETUP open --test-passphrase --token-id 0 -S5 $LOOPDEV || fail
+
+	$CRYPTSETUP open --test-passphrase -S5 --token-id 8 $LOOPDEV <&- || fail
+	$CRYPTSETUP open --test-passphrase -S5 $LOOPDEV <&- || fail
+
+	expect_unlocked_keyslot 5 "open -v --test-passphrase --token-id 8 -S5 $LOOPDEV" || fail
+	expect_unlocked_keyslot 5 "open -v --test-passphrase --token-id 8 $LOOPDEV" || fail
+
+	$CRYPTSETUP open --test-passphrase -S0 --token-id 8 $LOOPDEV --token-only >/dev/null && fail
+	[ $? -ne 2 ] && fail "open should return EPERM exit code."
+	$CRYPTSETUP open --test-passphrase -S1 $LOOPDEV --token-only && fail
+	[ $? -ne 2 ] && fail "open should return EPERM exit code."
 fi
 echo -n "$IMPORT_TOKEN" | $CRYPTSETUP token import $LOOPDEV --token-id 10 || fail
 echo -n "$IMPORT_TOKEN" | $CRYPTSETUP token import $LOOPDEV --token-id 11 --json-file - || fail
@@ -1270,8 +1357,7 @@ if [ $HAVE_KEYRING -gt 0 -a -d /proc/sys/kernel/keys ]; then
 	prepare "[45] Link VK to a keyring and use custom VK type." wipe
 
 	echo $PWD1 | $CRYPTSETUP -q luksFormat $FAST_PBKDF_OPT --type luks2 $LOOPDEV 2> /dev/null || fail
-	UUID=$($CRYPTSETUP luksDump $LOOPDEV | grep 'UUID:' | awk '{print $2}')
-	KEY_NAME="cryptsetup:$UUID-d0"
+	KEY_NAME="cryptsetup:test_volume_key_id"
 	test_and_prepare_keyring
 	KID=$(echo -n test | keyctl padd user my_token @s)
 	keyctl unlink $KID >/dev/null 2>&1 @s && SESSION_KEYRING_WORKS=1
@@ -1281,39 +1367,53 @@ if [ $HAVE_KEYRING -gt 0 -a -d /proc/sys/kernel/keys ]; then
 	test_vk_link $KEY_NAME "@u"
 	test_vk_link $KEY_NAME "@u" "user"
 	[[ ! -z "$SESSION_KEYRING_WORKS" ]] && test_vk_link $KEY_NAME "@s"
+	[[ ! -z "$SESSION_KEYRING_WORKS" ]] && test_vk_link $KEY_NAME "@s" "logon"
 	[[ ! -z "$SESSION_KEYRING_WORKS" ]] && test_vk_link $KEY_NAME "@s" "user"
-	[[ ! -z "$USER_SESSION_KEYRING_WORKS" ]] && test_vk_link $KEY_NAME "@us"
-	[[ ! -z "$USER_SESSION_KEYRING_WORKS" ]] && test_vk_link $KEY_NAME "@us" "user"
 	test_vk_link $KEY_NAME "%:$TEST_KEYRING_NAME"
 	test_vk_link $KEY_NAME "%:$TEST_KEYRING_NAME" "user"
+	test_vk_link $KEY_NAME "%:$TEST_KEYRING_NAME" "logon"
 	# explicitly specify keyring key type
 	test_vk_link $KEY_NAME "%keyring:$TEST_KEYRING_NAME"
 
 	test_vk_link_and_reactivate $KEY_NAME "@u" "user"
+	test_vk_link_and_reactivate $KEY_NAME "@u"
 	[[ ! -z "$SESSION_KEYRING_WORKS" ]] && test_vk_link_and_reactivate $KEY_NAME "@s" "user"
-	[[ ! -z "$USER_SESSION_KEYRING_WORKS" ]] && test_vk_link_and_reactivate $KEY_NAME "@us" "user"
 	test_vk_link_and_reactivate $KEY_NAME "%:$TEST_KEYRING_NAME" "user"
 	# explicitly specify keyring key type
 	test_vk_link_and_reactivate $KEY_NAME "%keyring:$TEST_KEYRING_NAME" "user"
+	test_vk_link_and_reactivate $KEY_NAME "%keyring:$TEST_KEYRING_NAME"
 
 	# test numeric keyring name -5 is user session (@us) keyring
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring -5 --volume-key-type logon || fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring -5::%logon:$KEY_NAME || fail
 	keyctl search @us logon $KEY_NAME > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after activation."
 	$CRYPTSETUP close $DEV_NAME
 	keyctl search @us logon $KEY_NAME > /dev/null 2>&1 || fail "VK is not linked to the specified keyring after deactivation."
 	keyctl unlink "%logon:$KEY_NAME" @us || fail
 
 	# test malformed keyring descriptions and key types
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "%user:$TEST_KEYRING_NAME" > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$TEST_KEYRING_NAME" > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "%$TEST_KEYRING_NAME" > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring ":$TEST_KEYRING_NAME" > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@uuu" > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@usu" > /dev/null 2>&1 && fail
+	# missing key description
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "%$TEST_KEYRING_NAME::" > /dev/null 2>&1 && fail
+	# malformed keyring description
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring ":$TEST_KEYRING_NAME::$KEY_NAME" > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@uuu::$KEY_NAME" > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@usu::$KEY_NAME" > /dev/null 2>&1 && fail
 
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-type 0 > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-type blah > /dev/null 2>&1 && fail
-	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --volume-key-type userlogon > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$TEST_KEYRING_NAME::%user" > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "$TEST_KEYRING_NAME::%user:" > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "%user:$KEY_NAME" > /dev/null 2>&1 && fail
+
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@t::%0:$KEY_NAME" > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@t::%blah:$KEY_NAME" > /dev/null 2>&1 && fail
+	echo $PWD1 | $CRYPTSETUP open $LOOPDEV $DEV_NAME --link-vk-to-keyring "@t::%userlogon:$KEY_NAME" > /dev/null 2>&1 && fail
+fi
+
+prepare "[45] Blkid disable check" wipe
+if [ "$HAVE_BLKID" -gt 0 ]; then
+	xz -dkf $HEADER_LUKS2_PV.xz
+	# batch mode disables blkid print, use --debug to check it
+	echo $PWD1 | $CRYPTSETUP -q --debug luksFormat $FAST_PBKDF_OPT --type luks2 $HEADER_LUKS2_PV 2>&1 | grep -q "LVM2_member" || fail
+	xz -dkf $HEADER_LUKS2_PV.xz
+	echo $PWD1 | $CRYPTSETUP -q --debug --disable-blkid luksFormat $FAST_PBKDF_OPT --type luks2 $HEADER_LUKS2_PV 2>&1 | grep -q "LVM2_member" && fail
 fi
 
 remove_mapping

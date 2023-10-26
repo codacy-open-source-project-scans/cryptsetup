@@ -306,7 +306,7 @@ static int reencrypt_luks2_load(struct crypt_device *cd, const char *data_device
 	if (!ARG_SET(OPT_BATCH_MODE_ID) && !ARG_SET(OPT_RESUME_ONLY_ID)) {
 		r = asprintf(&msg, _("Device %s is already in LUKS2 reencryption. "
 				     "Do you wish to resume previously initialised operation?"),
-			     crypt_get_metadata_device_name(cd) ?: data_device);
+			     crypt_get_metadata_device_name(cd) ?: crypt_get_device_name(cd));
 		if (r < 0) {
 			r = -ENOMEM;
 			goto out;
@@ -1328,9 +1328,15 @@ static int check_broken_luks_signature(const char *device)
 	int r;
 	size_t count;
 
+	if (ARG_SET(OPT_DISABLE_BLKID_ID))
+		return 0;
+
 	r = tools_detect_signatures(device, PRB_ONLY_LUKS, &count, ARG_SET(OPT_BATCH_MODE_ID));
-	if (r < 0)
+	if (r < 0) {
+		if (r == -EIO)
+			log_err(_("Blkid scan failed for %s."), device);
 		return -EINVAL;
+	}
 	if (count) {
 		log_err(_("Device %s contains broken LUKS metadata. Aborting operation."), device);
 		return -EINVAL;
