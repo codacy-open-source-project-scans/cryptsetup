@@ -1420,7 +1420,8 @@ static int strcmp_or_null(const char *str, const char *expected)
 
 int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_passwordLen)
 {
-	int r = -EINVAL, keysize, integrity_keysize = 0, fd, created = 0;
+	bool wipe_signatures = false;
+	int encrypt_type, r = -EINVAL, keysize, integrity_keysize = 0, fd, created = 0;
 	struct stat st;
 	const char *header_device, *type;
 	char *msg = NULL, *key = NULL, *password = NULL;
@@ -1465,6 +1466,11 @@ int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_password
 
 		if (ARG_SET(OPT_LUKS2_KEYSLOTS_SIZE_ID) || ARG_SET(OPT_LUKS2_METADATA_SIZE_ID)) {
 			log_err(_("Unsupported LUKS2 metadata size options."));
+			return -EINVAL;
+		}
+
+		if (ARG_SET(OPT_HW_OPAL_ID) || ARG_SET(OPT_HW_OPAL_ONLY_ID)) {
+			log_err(_("OPAL is supported only for LUKS2 format."));
 			return -EINVAL;
 		}
 	} else
@@ -1629,26 +1635,44 @@ int luksFormat(struct crypt_device **r_cd, char **r_password, size_t *r_password
 					    key, keysize,
 					    password, passwordLen);
 	if (r < 0) {
-		(void) tools_wipe_all_signatures(header_device, true, false);
+		wipe_signatures = true;
 		goto out;
 	}
 	tools_keyslot_msg(r, CREATED);
 
 	if (ARG_SET(OPT_INTEGRITY_ID) && !ARG_SET(OPT_INTEGRITY_NO_WIPE_ID) &&
-	    strcmp_or_null(params2.integrity, "none"))
+	    strcmp_or_null(params2.integrity, "none")) {
 		r = _wipe_data_device(cd);
+		/* Interrupted wipe should not fail luksFormat action */
+		if (r == -EINTR)
+			r = 0;
+	}
 out:
+	crypt_safe_free(key);
+
+	if (r < 0) {
+		encrypt_type = crypt_get_hw_encryption_type(cd);
+		if (encrypt_type == CRYPT_OPAL_HW_ONLY ||
+		    encrypt_type == CRYPT_SW_AND_OPAL_HW) {
+			(void) crypt_wipe_hw_opal(cd, CRYPT_LUKS2_SEGMENT,
+				opal_params.admin_key, opal_params.admin_key_size,
+				0);
+		}
+		if (wipe_signatures)
+			(void) tools_wipe_all_signatures(header_device, true, false);
+	}
+
+	crypt_safe_free(CONST_CAST(void *)opal_params.admin_key);
+
 	if (r >= 0 && r_cd && r_password && r_passwordLen) {
 		*r_cd = cd;
 		*r_password = password;
 		*r_passwordLen = passwordLen;
-	} else {
-		crypt_free(cd);
-		crypt_safe_free(password);
+		return r;
 	}
 
-	crypt_safe_free(key);
-	crypt_safe_free(CONST_CAST(void *)opal_params.admin_key);
+	crypt_free(cd);
+	crypt_safe_free(password);
 
 	return r;
 }
@@ -2862,9 +2886,10 @@ static int opal_erase(struct crypt_device *cd, bool factory_reset) {
 	int r;
 
 	r = tools_get_key(factory_reset ? _("Enter OPAL PSID: ") : _("Enter OPAL Admin password: "),
-				&password, &password_size,
-				0, 0, NULL,
-				ARG_UINT32(OPT_TIMEOUT_ID), verify_passphrase(1), !ARG_SET(OPT_FORCE_PASSWORD_ID), cd);
+				&password, &password_size, ARG_UINT64(OPT_KEYFILE_OFFSET_ID),
+				ARG_UINT32(OPT_KEYFILE_SIZE_ID), ARG_STR(OPT_KEY_FILE_ID),
+				ARG_UINT32(OPT_TIMEOUT_ID), verify_passphrase(1),
+				!ARG_SET(OPT_FORCE_PASSWORD_ID), cd);
 	if (r < 0)
 		return r;
 

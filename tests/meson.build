@@ -256,6 +256,16 @@ if get_option('cryptsetup')
         depends: [
             cryptsetup,
         ])
+    test('compat-test-opal',
+        find_program('./compat-test-opal'),
+        workdir: meson.current_build_dir(),
+        env: tests_env,
+        timeout: 14400,
+        is_parallel: false,
+        depends: [
+            cryptsetup,
+            differ,
+        ])
     test('loopaes-test',
         find_program('./loopaes-test'),
         workdir: meson.current_build_dir(),
@@ -402,15 +412,6 @@ if get_option('cryptsetup')
         ])
     test('luks2-reencryption-mangle-test',
         find_program('./luks2-reencryption-mangle-test'),
-        workdir: meson.current_build_dir(),
-        env: tests_env,
-        timeout: 14400,
-        is_parallel: false,
-        depends: [
-            cryptsetup,
-        ])
-    test('opal2-test',
-        find_program('./opal2-test'),
         workdir: meson.current_build_dir(),
         env: tests_env,
         timeout: 14400,

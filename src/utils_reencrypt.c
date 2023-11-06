@@ -349,11 +349,6 @@ static int luks2_reencrypt_in_progress(struct crypt_device *cd)
 	if (crypt_persistent_flags_get(cd, CRYPT_FLAGS_REQUIREMENTS, &flags))
 		return -EINVAL;
 
-	if (flags & CRYPT_REQUIREMENT_OFFLINE_REENCRYPT) {
-		log_err(_("Legacy LUKS2 reencryption is no longer supported."));
-		return -EINVAL;
-	}
-
 	return flags & CRYPT_REQUIREMENT_ONLINE_REENCRYPT;
 }
 
@@ -411,7 +406,16 @@ static enum device_status_info load_luks(struct crypt_device **r_cd,
 
 static bool luks2_reencrypt_eligible(struct crypt_device *cd)
 {
+	uint32_t flags;
 	struct crypt_params_integrity ip = { 0 };
+
+	if (crypt_persistent_flags_get(cd, CRYPT_FLAGS_REQUIREMENTS, &flags))
+		return false;
+
+	if (flags & CRYPT_REQUIREMENT_OFFLINE_REENCRYPT) {
+		log_err(_("Legacy LUKS2 reencryption is no longer supported."));
+		return false;
+	}
 
 	/* raw integrity info is available since 2.0 */
 	if (crypt_get_integrity_info(cd, &ip) || ip.tag_size) {
@@ -1461,6 +1465,8 @@ static int _decrypt(struct crypt_device **cd, enum device_status_info dev_st, co
 		if ((r = reencrypt_luks2_load(*cd, data_device)) < 0)
 			return r;
 	} else if (dev_st == DEVICE_LUKS2) {
+		if (!luks2_reencrypt_eligible(*cd))
+			return -EINVAL;
 		if (!ARG_SET(OPT_HEADER_ID)) {
 			log_err(_("LUKS2 decryption requires --header option."));
 			return -EINVAL;
