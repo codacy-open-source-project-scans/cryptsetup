@@ -260,7 +260,7 @@ int crypt_opal_supported(struct crypt_device *cd, struct device *opal_device)
 		if (r == -ENOTSUP)
 			log_err(cd, _("cryptsetup library SED OPAL2 support is disabled."));
 		else
-			log_err(cd, _("Device %s does not support OPAL2 HW encryption."),
+			log_err(cd, _("Device %s or kernel does not support OPAL2 HW encryption."),
 				    device_path(opal_device));
 		r = -EINVAL;
 	} else
@@ -381,7 +381,7 @@ static int isFVAULT2(const char *type)
 	return (type && !strcmp(CRYPT_FVAULT2, type));
 }
 
-static int _onlyLUKS(struct crypt_device *cd, uint32_t cdflags)
+static int _onlyLUKS(struct crypt_device *cd, uint32_t cdflags, uint32_t mask)
 {
 	int r = 0;
 
@@ -400,12 +400,22 @@ static int _onlyLUKS(struct crypt_device *cd, uint32_t cdflags)
 	if (r || (cdflags & CRYPT_CD_UNRESTRICTED) || isLUKS1(cd->type))
 		return r;
 
-	return LUKS2_unmet_requirements(cd, &cd->u.luks2.hdr, 0, cdflags & CRYPT_CD_QUIET);
+	return LUKS2_unmet_requirements(cd, &cd->u.luks2.hdr, mask, cdflags & CRYPT_CD_QUIET);
+}
+
+static int onlyLUKSunrestricted(struct crypt_device *cd)
+{
+	return _onlyLUKS(cd, CRYPT_CD_UNRESTRICTED, 0);
+}
+
+static int onlyLUKSnoRequirements(struct crypt_device *cd)
+{
+	return _onlyLUKS(cd, 0, 0);
 }
 
 static int onlyLUKS(struct crypt_device *cd)
 {
-	return _onlyLUKS(cd, 0);
+	return _onlyLUKS(cd, 0, CRYPT_REQUIREMENT_OPAL);
 }
 
 static int _onlyLUKS2(struct crypt_device *cd, uint32_t cdflags, uint32_t mask)
@@ -430,16 +440,21 @@ static int _onlyLUKS2(struct crypt_device *cd, uint32_t cdflags, uint32_t mask)
 	return LUKS2_unmet_requirements(cd, &cd->u.luks2.hdr, mask, cdflags & CRYPT_CD_QUIET);
 }
 
-/* Internal only */
-int onlyLUKS2(struct crypt_device *cd)
+static int onlyLUKS2unrestricted(struct crypt_device *cd)
 {
-	return _onlyLUKS2(cd, 0, 0);
+	return _onlyLUKS2(cd, CRYPT_CD_UNRESTRICTED, 0);
 }
 
 /* Internal only */
-int onlyLUKS2mask(struct crypt_device *cd, uint32_t mask)
+int onlyLUKS2(struct crypt_device *cd)
 {
-	return _onlyLUKS2(cd, 0, mask);
+	return _onlyLUKS2(cd, 0, CRYPT_REQUIREMENT_OPAL);
+}
+
+/* Internal only */
+int onlyLUKS2reencrypt(struct crypt_device *cd)
+{
+	return _onlyLUKS2(cd, 0, CRYPT_REQUIREMENT_ONLINE_REENCRYPT);
 }
 
 static void crypt_set_null_type(struct crypt_device *cd)
@@ -2467,6 +2482,11 @@ int crypt_format_luks2_opal(struct crypt_device *cd,
 			       device_size_bytes,
 			       opal_segment_number,
 			       opal_params->user_key_size);
+	if (r < 0)
+		goto out;
+
+	log_dbg(cd, "Adding LUKS2 OPAL requirement flag.");
+	r = LUKS2_config_set_requirement_version(cd, &cd->u.luks2.hdr, CRYPT_REQUIREMENT_OPAL, 1, false);
 	if (r < 0)
 		goto out;
 
@@ -4535,7 +4555,7 @@ int crypt_keyslot_destroy(struct crypt_device *cd, int keyslot)
 
 	log_dbg(cd, "Destroying keyslot %d.", keyslot);
 
-	if ((r = _onlyLUKS(cd, CRYPT_CD_UNRESTRICTED)))
+	if ((r = onlyLUKSunrestricted(cd)))
 		return r;
 
 	ki = crypt_keyslot_status(cd, keyslot);
@@ -5845,7 +5865,7 @@ int crypt_volume_key_verify(struct crypt_device *cd,
 	struct volume_key *vk;
 	int r;
 
-	if ((r = _onlyLUKS(cd, CRYPT_CD_UNRESTRICTED)))
+	if ((r = onlyLUKSunrestricted(cd)))
 		return r;
 
 	vk = crypt_alloc_volume_key(volume_key_size, volume_key);
@@ -6485,7 +6505,7 @@ uint64_t crypt_get_iv_offset(struct crypt_device *cd)
 
 crypt_keyslot_info crypt_keyslot_status(struct crypt_device *cd, int keyslot)
 {
-	if (_onlyLUKS(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED) < 0)
+	if (_onlyLUKS(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED, 0) < 0)
 		return CRYPT_SLOT_INVALID;
 
 	if (isLUKS1(cd->type))
@@ -6512,7 +6532,7 @@ int crypt_keyslot_area(struct crypt_device *cd,
 	uint64_t *offset,
 	uint64_t *length)
 {
-	if (_onlyLUKS(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED) || !offset || !length)
+	if (_onlyLUKS(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED, 0) || !offset || !length)
 		return -EINVAL;
 
 	if (isLUKS2(cd->type))
@@ -6523,7 +6543,7 @@ int crypt_keyslot_area(struct crypt_device *cd,
 
 crypt_keyslot_priority crypt_keyslot_get_priority(struct crypt_device *cd, int keyslot)
 {
-	if (_onlyLUKS(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED))
+	if (_onlyLUKS(cd, CRYPT_CD_QUIET | CRYPT_CD_UNRESTRICTED, 0))
 		return CRYPT_SLOT_PRIORITY_INVALID;
 
 	if (keyslot < 0 || keyslot >= crypt_keyslot_max(cd->type))
@@ -6670,7 +6690,7 @@ int crypt_convert(struct crypt_device *cd,
 
 	log_dbg(cd, "Converting LUKS device to type %s", type);
 
-	if ((r = onlyLUKS(cd)))
+	if ((r = onlyLUKSnoRequirements(cd)))
 		return r;
 
 	if (isLUKS1(cd->type) && isLUKS2(type))
@@ -6766,7 +6786,7 @@ int crypt_token_json_get(struct crypt_device *cd, int token, const char **json)
 
 	log_dbg(cd, "Requesting JSON for token %d.", token);
 
-	if ((r = _onlyLUKS2(cd, CRYPT_CD_UNRESTRICTED, 0)))
+	if ((r = onlyLUKS2unrestricted(cd)))
 		return r;
 
 	return LUKS2_token_json_get(&cd->u.luks2.hdr, token, json) ?: token;
@@ -6813,7 +6833,7 @@ int crypt_token_luks2_keyring_get(struct crypt_device *cd,
 
 	log_dbg(cd, "Requesting LUKS2 keyring token %d.", token);
 
-	if ((r = _onlyLUKS2(cd, CRYPT_CD_UNRESTRICTED, 0)))
+	if ((r = onlyLUKS2unrestricted(cd)))
 		return r;
 
 	token_info = LUKS2_token_status(cd, &cd->u.luks2.hdr, token, &type);
@@ -6928,7 +6948,7 @@ int crypt_persistent_flags_get(struct crypt_device *cd, crypt_flags_type type, u
 	if (!flags)
 		return -EINVAL;
 
-	if ((r = _onlyLUKS2(cd, CRYPT_CD_UNRESTRICTED, 0)))
+	if ((r = onlyLUKS2unrestricted(cd)))
 		return r;
 
 	if (type == CRYPT_FLAGS_ACTIVATION)
