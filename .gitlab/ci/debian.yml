@@ -6,13 +6,13 @@
     - >
       [ -z "$RUN_SYSTEMD_PLUGIN_TEST" ] ||
       sudo apt-get -y install -y -qq swtpm meson ninja-build python3-jinja2
-      gperf libcap-dev tpm2-tss-engine-dev libmount-dev swtpm-tools
+      gperf libcap-dev libtss2-dev libmount-dev swtpm-tools
     - >
       sudo apt-get -y install -y -qq git gcc make autoconf automake autopoint
       pkgconf libtool libtool-bin gettext libssl-dev libdevmapper-dev
       libpopt-dev uuid-dev libsepol-dev libjson-c-dev libssh-dev libblkid-dev
       tar libargon2-0-dev libpwquality-dev sharutils dmsetup jq xxd expect
-      keyutils netcat passwd openssh-client sshpass asciidoctor
+      keyutils netcat-openbsd passwd openssh-client sshpass asciidoctor
     - sudo apt-get -y build-dep cryptsetup
     - sudo -E git clean -xdf
     - ./autogen.sh
@@ -23,7 +23,7 @@ test-mergerq-job-debian:
     - .debian-prep
   tags:
     - libvirt
-    - debian11
+    - debian12
   stage: test
   interruptible: true
   variables:
@@ -42,7 +42,7 @@ test-main-commit-job-debian:
     - .debian-prep
   tags:
     - libvirt
-    - debian11
+    - debian12
   stage: test
   interruptible: true
   variables:
@@ -62,7 +62,7 @@ test-mergerq-job-debian-meson:
     - .debian-prep
   tags:
     - libvirt
-    - debian11
+    - debian12
   stage: test
   interruptible: true
   variables:
@@ -82,7 +82,7 @@ test-main-commit-job-debian-meson:
     - .debian-prep
   tags:
     - libvirt
-    - debian11
+    - debian12
   stage: test
   interruptible: true
   variables:

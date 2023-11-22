@@ -1,6 +1,6 @@
 project('cryptsetup',
     'c',
-    meson_version: '>=0.53',
+    meson_version: '>=0.64',
     version: '2.7.0-git')
 
 libcryptsetup_version = '12.9.0'
@@ -108,7 +108,7 @@ foreach header : required_headers
     conf.set10('HAVE_' + header.underscorify().to_upper(), cc.has_header(header))
 endforeach
 
-fcntl_header = conf.get('HAVE_FCNTL_H') == true ? 'fcntl.h' : 'stdio.h'
+fcntl_header = conf.get('HAVE_FCNTL_H') == 1 ? 'fcntl.h' : 'stdio.h'
 if cc.has_header_symbol(fcntl_header, 'O_CLOEXEC')
     conf.set10('HAVE_DECL_O_CLOEXEC', true)
 else
@@ -206,7 +206,7 @@ if cc.has_function('dlvsym',
 endif
 
 if get_option('external-tokens')
-    assert(conf.has('HAVE_DLVSYM') and conf.get('HAVE_DLVSYM') == true,
+    assert(conf.has('HAVE_DLVSYM') and conf.get('HAVE_DLVSYM') == 1,
         'dl library has no dlvsym function')
     conf.set10('USE_EXTERNAL_TOKENS', true,
         description: 'Use external tokens')
