@@ -178,6 +178,7 @@ static int device_ready(struct crypt_device *cd, struct device *device)
 	int devfd = -1, r = 0;
 	struct stat st;
 	size_t tmp_size;
+	const char *dm_name;
 
 	if (!device)
 		return -EINVAL;
@@ -188,7 +189,12 @@ static int device_ready(struct crypt_device *cd, struct device *device)
 		device->o_direct = 0;
 		devfd = open(device_path(device), O_RDONLY | O_DIRECT);
 		if (devfd >= 0) {
-			if (device_read_test(devfd) == 0) {
+			/* skip check for suspended DM devices */
+			dm_name = device_dm_name(device);
+			if (dm_name && dm_status_suspended(cd, dm_name)) {
+				close(devfd);
+				devfd = -1;
+			} else if (device_read_test(devfd) == 0) {
 				device->o_direct = 1;
 			} else {
 				close(devfd);
@@ -470,7 +476,7 @@ void device_free(struct crypt_device *cd, struct device *device)
 /* Get block device path */
 const char *device_block_path(const struct device *device)
 {
-	if (!device || !device->init_done)
+	if (!device)
 		return NULL;
 
 	return device->path;
@@ -482,7 +488,7 @@ const char *device_dm_name(const struct device *device)
 	const char *dmdir = dm_get_dir();
 	size_t dmdir_len = strlen(dmdir);
 
-	if (!device || !device->init_done)
+	if (!device)
 		return NULL;
 
 	if (strncmp(device->path, dmdir, dmdir_len))

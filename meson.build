@@ -1,9 +1,10 @@
 project('cryptsetup',
     'c',
+    default_options: [ 'prefix=/usr' ],
     meson_version: '>=0.64',
-    version: '2.7.0-git')
+    version: '2.7.0-rc0')
 
-libcryptsetup_version = '12.9.0'
+libcryptsetup_version = '12.10.0'
 
 includes_root = include_directories('.')
 includes_lib = include_directories('lib')
@@ -84,7 +85,7 @@ if enable_static == true
     if not sanitizer_enabled
         link_args += '--static'
     else
-        warning('Turning off statically linked binaries as they are not compatible with sanitizer build. Will keep prefering static external dependencies.')
+        warning('Turning off statically linked binaries as they are not compatible with sanitizer build. Will keep preferring static external dependencies.')
     endif
 endif
 
