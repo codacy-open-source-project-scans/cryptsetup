@@ -1,8 +1,8 @@
 /*
  * LUKS - Linux Unified Key Setup v2, reencryption helpers
  *
- * Copyright (C) 2015-2023 Red Hat, Inc. All rights reserved.
- * Copyright (C) 2015-2023 Ondrej Kozina
+ * Copyright (C) 2015-2024 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2015-2024 Ondrej Kozina
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -181,6 +181,21 @@ int LUKS2_reencrypt_digest_new(struct luks2_hdr *hdr)
 int LUKS2_reencrypt_digest_old(struct luks2_hdr *hdr)
 {
 	return reencrypt_digest(hdr, 0);
+}
+
+unsigned LUKS2_reencrypt_vks_count(struct luks2_hdr *hdr)
+{
+	int digest_old, digest_new;
+	unsigned vks_count = 0;
+
+	if ((digest_new = LUKS2_reencrypt_digest_new(hdr)) >= 0)
+		vks_count++;
+	if ((digest_old = LUKS2_reencrypt_digest_old(hdr)) >= 0) {
+		if (digest_old != digest_new)
+			vks_count++;
+	}
+
+	return vks_count;
 }
 
 /* none, checksums, journal or shift */
@@ -4418,6 +4433,39 @@ out:
 	crypt_free_volume_key(_vks);
 
 	return r < 0 ? r : keyslot;
+}
+
+int LUKS2_reencrypt_locked_recovery_by_vks(struct crypt_device *cd,
+	struct volume_key *vks)
+{
+	uint64_t minimal_size, device_size;
+	int r = -EINVAL;
+	struct luks2_hdr *hdr = crypt_get_hdr(cd, CRYPT_LUKS2);
+	struct volume_key *vk = NULL;
+
+	log_dbg(cd, "Entering reencryption crash recovery.");
+
+	if (LUKS2_get_data_size(hdr, &minimal_size, NULL))
+		return r;
+
+	if (crypt_use_keyring_for_vk(cd))
+		vk = vks;
+	while (vk) {
+		r = LUKS2_volume_key_load_in_keyring_by_digest(cd, vk, crypt_volume_key_get_id(vk));
+		if (r < 0)
+			goto out;
+		vk = crypt_volume_key_next(vk);
+	}
+
+	if (LUKS2_reencrypt_check_device_size(cd, hdr, minimal_size, &device_size, true, false))
+		goto out;
+
+	r = reencrypt_recovery(cd, hdr, device_size, vks);
+
+out:
+	if (r < 0)
+		crypt_drop_keyring_key(cd, vks);
+	return r;
 }
 #endif
 crypt_reencrypt_info LUKS2_reencrypt_get_params(struct luks2_hdr *hdr,
